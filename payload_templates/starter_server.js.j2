@@ -1,0 +1,312 @@
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+
+const PORT = Number(process.env.PORT || 18444);
+const DATA_DIR = path.join(__dirname, "data");
+const EVENTS_FILE = path.join(DATA_DIR, "events.jsonl");
+const EVENT_FILE_MAX_BYTES = 1024 * 1024;
+const EVENT_BACKUPS = 3;
+const EVENT_RECORD_MAX_BYTES = 8192;
+const EVENT_FIELD_MAX_BYTES = 1024;
+let lastLogFailureAt = 0;
+
+function send(res, status, payload, headers = {}) {
+  const body = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
+  res.writeHead(status, {
+    "Content-Type": typeof payload === "string" ? "text/plain; charset=utf-8" : "application/json; charset=utf-8",
+    "X-Demo-Runtime": "node",
+    ...headers
+  });
+  res.end(body);
+}
+
+function readBody(req, maxBytes = 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    let size = 0;
+    req.on("data", chunk => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        reject(new Error("request_body_too_large"));
+        req.destroy();
+        return;
+      }
+      raw += chunk;
+    });
+    req.on("end", () => resolve(raw));
+    req.on("error", reject);
+  });
+}
+
+function eventRecord(event) {
+  let truncated = false;
+  function bounded(value, depth = 0) {
+    if (typeof value === "string") {
+      if (value.length <= EVENT_FIELD_MAX_BYTES && Buffer.byteLength(value) <= EVENT_FIELD_MAX_BYTES) return value;
+      truncated = true;
+      return Buffer.from(value.slice(0, EVENT_FIELD_MAX_BYTES)).subarray(0, EVENT_FIELD_MAX_BYTES - 16)
+        .toString("utf8").replace(/\uFFFD$/, "") + "[truncated]";
+    }
+    if (value === null || typeof value === "number" || typeof value === "boolean") return value;
+    if (depth >= 3 || typeof value !== "object") {
+      truncated = true;
+      return "[truncated]";
+    }
+    const entries = Object.entries(value);
+    if (entries.length > 16) truncated = true;
+    if (Array.isArray(value)) return entries.slice(0, 16).map(([, item]) => bounded(item, depth + 1));
+    return Object.fromEntries(entries.slice(0, 16).map(([key, item]) => [bounded(key), bounded(item, depth + 1)]));
+  }
+  const record = bounded(event);
+  record.at = new Date().toISOString();
+  if (truncated) record.log_truncated = true;
+  let line = JSON.stringify(record) + "\n";
+  if (Buffer.byteLength(line) > EVENT_RECORD_MAX_BYTES) {
+    // Keep event identity when nested caller data exceeds the whole-record budget.
+    line = JSON.stringify({
+      runtime: "node", event: String(event.event || "request").slice(0, 64),
+      method: String(event.method || "").slice(0, 32), path: String(event.path || "").slice(0, 256),
+      level: String(event.level || "").slice(0, 32), log_truncated: true, at: record.at
+    }) + "\n";
+  }
+  return line;
+}
+
+function boundExistingLog(file, repairPartial = false) {
+  let size;
+  try {
+    size = fs.statSync(file).size;
+  } catch (err) {
+    if (err.code === "ENOENT") return 0;
+    throw err;
+  }
+  if (!size || (size <= EVENT_FILE_MAX_BYTES && !repairPartial)) return size;
+  const fd = fs.openSync(file, "r+");
+  try {
+    if (size <= EVENT_FILE_MAX_BYTES) {
+      const last = Buffer.alloc(1);
+      fs.readSync(fd, last, 0, 1, size - 1);
+      if (last[0] === 10) return size;
+    }
+    // Read a bounded suffix, including for oversized logs inherited from older releases.
+    const start = Math.max(0, size - EVENT_FILE_MAX_BYTES);
+    const bytes = Buffer.alloc(size - start);
+    let read = 0;
+    while (read < bytes.length) {
+      const count = fs.readSync(fd, bytes, read, bytes.length - read, start + read);
+      if (!count) break;
+      read += count;
+    }
+    const suffix = bytes.subarray(0, read);
+    const first = start ? suffix.indexOf(10) + 1 : 0;
+    const end = suffix.lastIndexOf(10) + 1;
+    const retained = suffix.subarray(first, Math.max(first, end));
+    let written = 0;
+    while (written < retained.length) {
+      const count = fs.writeSync(fd, retained, written, retained.length - written, written);
+      if (!count) throw new Error("event_log_short_write");
+      written += count;
+    }
+    fs.ftruncateSync(fd, retained.length);
+    return retained.length;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function logEvent(event) {
+  try {
+    const line = eventRecord(event);
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    for (let index = EVENT_BACKUPS; index > 0; index--) boundExistingLog(`${EVENTS_FILE}.${index}`);
+    const size = boundExistingLog(EVENTS_FILE, true);
+    if (size + Buffer.byteLength(line) > EVENT_FILE_MAX_BYTES) {
+      for (let index = EVENT_BACKUPS; index > 0; index--) {
+        const destination = `${EVENTS_FILE}.${index}`;
+        const source = index === 1 ? EVENTS_FILE : `${EVENTS_FILE}.${index - 1}`;
+        fs.rmSync(destination, { force: true });
+        try { fs.renameSync(source, destination); } catch (err) { if (err.code !== "ENOENT") throw err; }
+      }
+    }
+    fs.appendFileSync(EVENTS_FILE, line);
+    lastLogFailureAt = 0;
+  } catch {
+    // Disk/permission failures must not stop request serving or recursively invoke logging.
+    const now = Date.now();
+    if (!lastLogFailureAt || now - lastLogFailureAt >= 60000) {
+      lastLogFailureAt = now;
+      try { console.error("[STARTER_LOG_ERROR] Event log unavailable; logging will be retried."); } catch {}
+    }
+  }
+}
+
+function requestUrl(target) {
+  if (typeof target !== "string" || !target.startsWith("/") || target.startsWith("//") || /[\u0000-\u0020\u007f\\#]/.test(target)) {
+    throw new Error("invalid_request_target");
+  }
+  // Validate escapes without reinterpreting encoded query data or recursively decoding paths.
+  if (/%(?![0-9a-f]{2})/i.test(target)) throw new Error("invalid_request_target");
+  const url = new URL(target, "http://starter.invalid");
+  const decodedPath = decodeURIComponent(url.pathname);
+  if (url.origin !== "http://starter.invalid" || decodedPath.startsWith("//") || /[\u0000-\u001f\u007f\\]/.test(decodedPath)) {
+    throw new Error("invalid_request_target");
+  }
+  return url;
+}
+
+function parseJson(raw) {
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+// A standalone example application. Gateway security belongs to Infraveil's
+// local runtime, not to custom risk-scoring code inside the application.
+const products = [
+  { id: 1, name: "Notebook", price: 12 },
+  { id: 2, name: "Backpack", price: 49 },
+  { id: 3, name: "Desk lamp", price: 35 }
+];
+
+const users = [
+  { id: 1, name: "Sample customer", role: "customer" },
+  { id: 2, name: "Sample operator", role: "operator" }
+];
+
+async function handleRequest(req, res) {
+  let url;
+  const ip = req.socket.remoteAddress || "unknown";
+
+  try {
+    try {
+      url = requestUrl(req.url);
+    } catch {
+      logEvent({ runtime: "node", event: "invalid_request_target", method: req.method, path: req.url, ip });
+      return send(res, 400, { error: "invalid_request_target" });
+    }
+    logEvent({ runtime: "node", method: req.method, path: url.pathname, ip, johnny_target: req.headers["x-infraveil-johnny-target"] || "" });
+    if ((url.pathname === "/" || url.pathname === "/health") && req.method === "GET") {
+      return send(res, 200, {
+        service: "starter-api",
+        status: "online",
+        runtime: "node",
+        gateway: "infraveil",
+        runtimes: ["node"],
+        message: "Demo API is online. Infraveil supervises this application and its managed gateway."
+      });
+    }
+
+    if (url.pathname === "/api/status" && req.method === "GET") {
+      return send(res, 200, {
+        status: "online",
+        runtime: "node",
+        service: "starter-api",
+        gateway: "infraveil",
+        persistent_log: "data/events.jsonl",
+        johnny_target: req.headers["x-infraveil-johnny-target"] || url.searchParams.get("johnny_target") || null
+      });
+    }
+
+    if (url.pathname === "/api/data" && req.method === "GET") {
+      return send(res, 200, {
+        records: [
+          { id: "evt_1", type: "normal_traffic", status: "captured" },
+          { id: "evt_2", type: "runtime_probe", status: "captured" }
+        ],
+        served_by: "starter-api"
+      });
+    }
+
+    if (url.pathname === "/api/products" && req.method === "GET") {
+      return send(res, 200, { products, served_by: "starter-api" });
+    }
+
+    if (url.pathname === "/api/users" && req.method === "GET") {
+      return send(res, 200, { users, served_by: "starter-api" });
+    }
+
+    if (url.pathname === "/api/orders" && req.method === "POST") {
+      const raw = await readBody(req);
+      const body = parseJson(raw);
+      if (body.product_id && !products.some(product => product.id === body.product_id)) {
+        return send(res, 404, { error: "product_not_found", served_by: "starter-api" });
+      }
+      const order = {
+        id: `ord_${Date.now()}`,
+        user_id: body.user_id || null,
+        product_id: body.product_id || null,
+        status: body.product_id ? "accepted" : "review",
+        served_by: "starter-api"
+      };
+      logEvent({ runtime: "node", event: "order_created", order });
+      return send(res, body.product_id ? 201 : 202, order);
+    }
+
+    if (url.pathname === "/api/auth/login" && req.method === "POST") {
+      const raw = await readBody(req);
+      const body = parseJson(raw);
+      const username = String(body.username || "anonymous");
+      const commonUser = ["admin", "root", "test"].includes(username.toLowerCase());
+      const blocked = commonUser;
+      return send(res, blocked ? 401 : 200, {
+        authenticated: !blocked,
+        username,
+        message: blocked ? "Sample login rejected. This endpoint does not create real user sessions." : "Sample login accepted. This endpoint does not create real user sessions.",
+        served_by: "starter-api"
+      });
+    }
+
+    if (url.pathname === "/api/headers" && req.method === "GET") {
+      return send(res, 200, {
+        headers: {
+          user_agent: req.headers["user-agent"] || "",
+          johnny_target: req.headers["x-infraveil-johnny-target"] || ""
+        },
+        served_by: "starter-api"
+      });
+    }
+
+    if (url.pathname === "/api/slow" && req.method === "GET") {
+      const delay = Math.max(50, Math.min(3000, Number(url.searchParams.get("ms") || 500)));
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return send(res, 200, { status: "ok", delay_ms: delay, served_by: "starter-api" });
+    }
+
+    if (url.pathname === "/api/demo-error" && req.method === "GET") {
+      const err = new Error("Intentional demo failure from /api/demo-error");
+      err.code = "INFRAVEIL_DEMO_ERROR";
+      throw err;
+    }
+
+    return send(res, 404, { error: "not_found", path: url.pathname });
+  } catch (err) {
+    const requestPath = url ? url.pathname : "";
+    logEvent({ runtime: "node", level: "error", message: err.message, path: requestPath });
+    console.error(`[DEMO_ERROR] ${err.stack || err.message}`);
+    return send(res, 500, {
+      error: "demo_api_error",
+      code: err.code || "DEMO_API_ERROR",
+      message: err.message,
+      path: requestPath
+    });
+  }
+}
+
+const server = http.createServer((req, res) => {
+  // HTTP does not observe a promise returned by an async request listener.
+  handleRequest(req, res).catch(() => {
+    try {
+      if (!res.headersSent && !res.destroyed) return send(res, 500, { error: "demo_api_error" });
+    } catch {}
+    res.destroy();
+  });
+});
+
+logEvent({ runtime: "node", event: "startup" });
+const listenFd = process.env.INFRAVEIL_LISTEN_FD;
+const listenTarget = listenFd === undefined ? { port: PORT, host: "127.0.0.1" } : { fd: Number(listenFd) };
+server.listen(listenTarget, () => console.log(`Infraveil demo API listening on ${server.address().port}`));

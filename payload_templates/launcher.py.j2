@@ -1,0 +1,3659 @@
+
+import os, sys, time, subprocess, signal, threading, ctypes, json, hashlib, hmac, urllib.parse, importlib, importlib.util, re, platform, socket, uuid, base64, shutil, site, random, plistlib, tempfile, types, ast, csv
+from datetime import datetime, timezone
+
+TRUST_CONSOLE_B64 = "{{ trust_console_b64 }}"
+RUNTIME_DEPENDENCY_STATUS = {}
+_RUNTIME_MANAGER_CACHE = {}
+MINIMUM_AGENT_SOURCE_SECURITY_EPOCH = 1
+_AGENT_SOURCE_SECURITY_EPOCH_NAME = "INFRAVEIL_AGENT_SOURCE_SECURITY_EPOCH"
+
+def _runtime_manager(encoded):
+    if not encoded or len(encoded) > 2 * 1024 * 1024:
+        raise RuntimeError("Approved embedded Trust Console runtime contract is missing")
+    identity = hashlib.sha256(encoded.encode("ascii")).hexdigest()
+    cached = _RUNTIME_MANAGER_CACHE.get(identity)
+    if cached is not None:
+        return cached
+    source = base64.b64decode(encoded.encode("ascii"), validate=True).decode("utf-8")
+    manager = types.ModuleType("_infraveil_approved_runtime_manager")
+    manager.__file__ = os.path.abspath(__file__)
+    exec(compile(source, "<approved embedded Trust Console>", "exec"), manager.__dict__)
+    if len(_RUNTIME_MANAGER_CACHE) >= 8:
+        _RUNTIME_MANAGER_CACHE.clear()
+    _RUNTIME_MANAGER_CACHE[identity] = manager
+    return manager
+
+def _select_managed_runtime(manager):
+    inherited = str(os.environ.get("INFRAVEIL_MANAGED_RUNTIME_HOME") or "")
+    if inherited and manager._current_runtime_matches(inherited):
+        return sys.executable, os.path.abspath(inherited)
+    inferred = os.path.dirname(os.path.abspath(sys.prefix))
+    if manager._current_runtime_matches(inferred):
+        return sys.executable, inferred
+    home = os.path.join(os.path.dirname(os.path.realpath(__file__)), ".infraveil", "runtime")
+    if manager._current_runtime_matches(home):
+        return sys.executable, home
+    return manager._prepare_runtime(home), home
+
+def _ensure_launcher_dependencies():
+    global RUNTIME_DEPENDENCY_STATUS
+    manager = _runtime_manager(TRUST_CONSOLE_B64)
+    python_path, home = _select_managed_runtime(manager)
+    if not manager._current_runtime_matches(home):
+        env = manager._sanitized_runtime_env(home)
+        if os.environ.get("INFRAVEIL_NONINTERACTIVE") == "1":
+            env["INFRAVEIL_START_GUARD_ADMITTED"] = "1"
+        os.execve(python_path, [python_path, "-I", os.path.abspath(__file__)] + sys.argv[1:], env)
+        raise RuntimeError("Managed runtime restart did not replace the launcher process")
+    RUNTIME_DEPENDENCY_STATUS = {"dependency_lock_sha256": manager._runtime_lock_identity(), "dependency_versions": dict(requirement.split("==", 1) for requirement, _hashes in manager.LOCKED_WHEEL_HASHES), "dependency_runtime_managed": True}
+    return python_path
+
+def _runtime_python_for_source(source):
+    tree = ast.parse(source)
+    values = [node.value for node in tree.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "TRUST_CONSOLE_B64" for target in node.targets)]
+    if not values:
+        _ensure_launcher_dependencies()
+        return sys.executable, dict(os.environ)
+    if len(values) != 1:
+        raise RuntimeError("Runtime source has ambiguous dependency contracts")
+    encoded = ast.literal_eval(values[0])
+    if not isinstance(encoded, str):
+        raise RuntimeError("Runtime source dependency contract is not a quoted approved value")
+    manager = _runtime_manager(encoded)
+    python_path, home = _select_managed_runtime(manager)
+    return python_path, manager._sanitized_runtime_env(home)
+
+def _require_agent_source_security_epoch(source):
+    """Reject cached or fetched agent source from before a security boundary."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, TypeError, ValueError) as exc:
+        raise RuntimeError("Agent source security epoch is missing or invalid") from exc
+    values = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == _AGENT_SOURCE_SECURITY_EPOCH_NAME
+            for target in node.targets
+        )
+    ]
+    if len(values) != 1:
+        raise RuntimeError("Agent source security epoch is missing or ambiguous")
+    try:
+        epoch = ast.literal_eval(values[0])
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("Agent source security epoch is not a literal integer") from exc
+    if isinstance(epoch, bool) or not isinstance(epoch, int):
+        raise RuntimeError("Agent source security epoch is not a literal integer")
+    if epoch < MINIMUM_AGENT_SOURCE_SECURITY_EPOCH:
+        raise RuntimeError("Agent source is below the minimum security epoch")
+    return epoch
+
+LAUNCHER_START_WINDOW_SECONDS = 300
+LAUNCHER_START_MAX_ADMISSIONS = 5
+LAUNCHER_START_LOCK_WAIT_SECONDS = 5
+LAUNCHER_START_LOCK_STALE_SECONDS = 30
+
+def _launcher_start_guard_error(state_path, exc):
+    detail = str(exc).strip()[:120] or exc.__class__.__name__
+    return (
+        "[INFRAVEIL]  Supervised launcher start blocked because the restart guard state "
+        "could not be safely read or updated (" + detail + "). The service will stop retrying. "
+        "Review " + state_path + ", fix its ownership/permissions or malformed contents, then "
+        "start the service again. Manual launcher runs remain available without "
+        "INFRAVEIL_NONINTERACTIVE=1."
+    )
+
+def _acquire_launcher_start_lock(state_dir, now):
+    lock_path = os.path.join(state_dir, "launcher_start_budget.lock")
+    deadline = time.monotonic() + LAUNCHER_START_LOCK_WAIT_SECONDS
+    while True:
+        try:
+            os.mkdir(lock_path, 0o700)
+            return lock_path
+        except FileExistsError:
+            try:
+                stat_result = os.stat(lock_path, follow_symlinks=False)
+                age = now - float(stat_result.st_mtime)
+                if (
+                    age > LAUNCHER_START_LOCK_STALE_SECONDS
+                    and os.path.isdir(lock_path)
+                    and not os.path.islink(lock_path)
+                ):
+                    os.rmdir(lock_path)
+                    continue
+            except FileNotFoundError:
+                continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise RuntimeError("restart guard lock remained busy")
+            time.sleep(0.05)
+
+def _read_launcher_start_state(state_path):
+    if not os.path.lexists(state_path):
+        return []
+    if os.path.islink(state_path) or not os.path.isfile(state_path):
+        raise ValueError("restart guard state is not a regular file")
+    if os.path.getsize(state_path) > 65536:
+        raise ValueError("restart guard state is unexpectedly large")
+    os.chmod(state_path, 0o600)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(state_path, flags)
+    with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+        value = json.load(handle)
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise ValueError("restart guard state has an unsupported format")
+    starts = value.get("starts")
+    if not isinstance(starts, list) or len(starts) > 1000:
+        raise ValueError("restart guard start history is invalid")
+    validated = []
+    for item in starts:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ValueError("restart guard start history contains a non-number")
+        stamp = float(item)
+        if stamp < 0 or stamp != stamp or stamp == float("inf"):
+            raise ValueError("restart guard start history contains an invalid time")
+        validated.append(stamp)
+    return validated
+
+def _write_launcher_start_state(state_dir, state_path, starts):
+    descriptor, temp_path = tempfile.mkstemp(
+        prefix=".launcher_start_budget.", suffix=".tmp", dir=state_dir
+    )
+    try:
+        os.chmod(temp_path, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            json.dump({"version": 1, "starts": starts}, handle, separators=(",", ":"), sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, state_path)
+        os.chmod(state_path, 0o600)
+        try:
+            directory_fd = os.open(state_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.remove(temp_path)
+        except FileNotFoundError:
+            pass
+
+def _admit_supervised_launcher_start(now=None, state_dir=None):
+    if (
+        os.environ.get("INFRAVEIL_NONINTERACTIVE") != "1"
+        or os.environ.get("INFRAVEIL_START_GUARD_ADMITTED") == "1"
+    ):
+        return True, ""
+    now = time.time() if now is None else float(now)
+    state_dir = state_dir or os.path.join(os.path.dirname(os.path.realpath(__file__)), ".infraveil")
+    state_path = os.path.join(state_dir, "launcher_start_budget.json")
+    lock_path = None
+    result = None
+    try:
+        if now < 0 or now != now or now == float("inf"):
+            raise ValueError("system clock is invalid")
+        if os.path.lexists(state_dir):
+            if os.path.islink(state_dir) or not os.path.isdir(state_dir):
+                raise ValueError("restart guard directory is not a regular directory")
+        else:
+            os.makedirs(state_dir, mode=0o700)
+        os.chmod(state_dir, 0o700)
+        lock_path = _acquire_launcher_start_lock(state_dir, now)
+        starts = _read_launcher_start_state(state_path)
+        window_start = now - LAUNCHER_START_WINDOW_SECONDS
+        starts = [now if stamp > now else stamp for stamp in starts if stamp > window_start]
+        if len(starts) >= LAUNCHER_START_MAX_ADMISSIONS:
+            result = (False, (
+                "[INFRAVEIL]  Supervised launcher restart budget exhausted: "
+                + str(LAUNCHER_START_MAX_ADMISSIONS) + " starts were admitted within "
+                + str(LAUNCHER_START_WINDOW_SECONDS) + " seconds. The service will stop retrying. "
+                "Review the launcher logs and configuration, then start the service again after the "
+                "window expires. Manual launcher runs remain available without "
+                "INFRAVEIL_NONINTERACTIVE=1."
+            ))
+        else:
+            starts.append(now)
+            _write_launcher_start_state(state_dir, state_path, starts)
+            result = (True, "")
+    except Exception as exc:
+        result = (False, _launcher_start_guard_error(state_path, exc))
+    finally:
+        if lock_path is not None:
+            try:
+                os.rmdir(lock_path)
+            except Exception as exc:
+                if result is None or result[0]:
+                    result = (False, _launcher_start_guard_error(state_path, exc))
+    return result
+
+def _enforce_supervised_launcher_start_budget():
+    admitted, message = _admit_supervised_launcher_start()
+    if admitted:
+        return
+    print(message, flush=True)
+    raise SystemExit(0)
+
+if __name__ == "__main__":
+    _enforce_supervised_launcher_start_budget()
+
+if sys.version_info < (3, 8):
+    print("[INFRAVEIL]  Python 3.8 or newer is required to run the launcher.")
+    print("[INFRAVEIL]  You are running Python " + platform.python_version() + ".")
+    print("[INFRAVEIL]  Install a current version from https://www.python.org/downloads/ and run the command again.")
+    sys.exit(1)
+
+if __name__ == "__main__":
+    _ensure_launcher_dependencies()
+import requests
+import psutil
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+CLIENT_ID = "{{ client_id }}"
+LAUNCHER_TOKEN = "{{ launcher_token }}"
+LAUNCHER_HOST_ID = "{{ launcher_host_id }}"
+BASE_URL = "{{ base_url }}"
+RELEASE_PUBLIC_KEY = "{{ release_public_key }}"
+CUSTOMER_APPROVAL_KEY = "{{ customer_approval_key }}".strip().lower()
+CHECK_INTERVAL = 5
+CONTROL_POLL_INTERVAL = 0.5
+LAUNCHER_VERSION = "{{ runtime_version }}".strip() or "2026.06.18"
+FAST_RETRY_INTERVAL = 1.0
+HTTP_CONNECT_TIMEOUT = 10
+HTTP_READ_TIMEOUT = 20
+AGENT_RESPAWN_WINDOW_SECONDS = 300
+AGENT_RESPAWN_MAX_ATTEMPTS = 6
+AGENT_FETCH_RETRY_DELAY_SECONDS = 10
+AGENT_CANDIDATE_HEALTH_SECONDS = 60
+
+agents = {}
+shutdown_flag = False
+ANSI_ENABLED = False
+ANSI_GREY = "\x1b[90m"
+ANSI_RESET = "\x1b[0m"
+ANSI_WHITE = "\x1b[97m"
+PYTHON_CMD = None
+shutdown_in_progress = False
+control_plane_online = True
+sync_failure_count = 0
+last_control_revision = 0
+last_control_epoch = ""
+control_poll_interval = CONTROL_POLL_INTERVAL
+control_poll_failures = 0
+last_stopped_notice_signature = ()
+_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+_DATA_DIR = os.path.join(_SCRIPT_DIR, ".infraveil")
+try:
+    os.makedirs(_DATA_DIR, exist_ok=True)
+except Exception:
+    _DATA_DIR = _SCRIPT_DIR
+LOCK_PATH = os.path.join(_DATA_DIR, "launcher.lock")
+STATE_PATH = os.path.join(_DATA_DIR, "launcher_state.json")
+AUDIT_PATH = os.path.join(_DATA_DIR, "launcher_audit.jsonl")
+LAUNCHER_PREVIOUS_PATH = os.path.join(_DATA_DIR, "launcher_previous.py")
+LAUNCHER_UPDATE_MARKER = os.path.join(_DATA_DIR, "launcher_update_pending.json")
+HTTP = requests.Session()
+agent_runtime_meta = {}
+agent_job_handles = {}
+_pending_cache_purge_ack = {}
+_pending_agent_cache_purge_acks = {}
+_completed_cache_purge_request_id = ""
+_completed_agent_cache_purge_request_ids = {}
+_pending_command_results = {}
+_completed_command_results = {}
+_command_delivery_protocol = 1
+_held_receiptless_commands = set()
+COMMAND_RESULT_BATCH_LIMIT = 5000
+COMMAND_RESULT_TOMBSTONE_LIMIT = 5500
+last_capacity_diagnostic = {}
+RUNTIME_CACHE_MAGIC = "INFV_RUNTIME_CACHE_V1:"
+ONBOARD_PATH = os.path.join(_DATA_DIR, "infraveil_onboarding.json")
+AUDIT_MAX_BYTES = 5 * 1024 * 1024
+ONBOARDING = {}
+NONINTERACTIVE = False
+
+def _restrict_private_windows_path(path, directory=False):
+    system32 = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32")
+    identity = subprocess.run(
+        [os.path.join(system32, "whoami.exe"), "/user", "/fo", "csv", "/nh"],
+        capture_output=True, text=True, check=True, timeout=15,
+    )
+    rows = list(csv.reader(identity.stdout.splitlines()))
+    if len(rows) != 1 or len(rows[0]) != 2 or not re.fullmatch(r"S-\d+(?:-\d+)+", rows[0][1]):
+        raise RuntimeError("Could not identify the Windows account for private runtime files")
+    permission = "*" + rows[0][1] + (":(OI)(CI)F" if directory else ":F")
+    subprocess.run(
+        [os.path.join(system32, "icacls.exe"), os.path.abspath(path), "/inheritance:r", "/grant:r", permission],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True, timeout=15,
+    )
+
+def _atomic_write_bytes(path, data):
+    """Keep exact signed bytes private before writing and across replacement."""
+    if not isinstance(data, bytes):
+        raise TypeError("Private runtime writes require bytes")
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target)
+    # A private staging directory protects creation-time ACLs without changing
+    # permissions on a caller's Downloads, Startup or LaunchAgents directory.
+    staging = tempfile.mkdtemp(prefix=".infraveil-write-", dir=parent)
+    temporary = os.path.join(staging, "payload")
+    descriptor = None
+    try:
+        if os.name == "nt":
+            _restrict_private_windows_path(staging, directory=True)
+        else:
+            os.chmod(staging, 0o700)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+        if os.name == "nt":
+            _restrict_private_windows_path(temporary)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = None
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        shutil.rmtree(staging)
+
+def _atomic_write_text(path, text):
+    _atomic_write_bytes(path, text.encode("utf-8"))
+
+def _validate_launcher_source_context(source, expected_version):
+    """The already-verified source signature also signs these generated fields."""
+    tree = ast.parse(source)
+    names = {"CLIENT_ID", "LAUNCHER_HOST_ID", "LAUNCHER_VERSION"}
+    definitions = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name) and target.id in names:
+                if target.id in definitions:
+                    raise ValueError("Ambiguous launcher deployment identity")
+                definitions[target.id] = node.value
+    # Reject annotated, tuple, augmented, nested and other duplicate bindings.
+    for name in names:
+        stores = [node for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, (ast.Store, ast.Del))]
+        if len(stores) != 1 or name not in definitions:
+            raise ValueError("Missing or ambiguous launcher deployment identity: " + name)
+
+    def literal(node):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            raise ValueError("Launcher deployment identity must be a string literal")
+        return node.value
+
+    client_id = literal(definitions["CLIENT_ID"])
+    host_id = literal(definitions["LAUNCHER_HOST_ID"])
+    version_node = definitions["LAUNCHER_VERSION"]
+    if isinstance(version_node, ast.Constant):
+        version = literal(version_node)
+    elif isinstance(version_node, ast.BoolOp) and isinstance(version_node.op, ast.Or) and len(version_node.values) == 2:
+        call, fallback = version_node.values
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == "strip" and not call.args and not call.keywords):
+            raise ValueError("Unsupported launcher version declaration")
+        version = literal(call.func.value).strip() or literal(fallback)
+        literal(fallback)
+    else:
+        raise ValueError("Unsupported launcher version declaration")
+    if client_id != CLIENT_ID or host_id != LAUNCHER_HOST_ID:
+        raise ValueError("Signed launcher belongs to a different client or host")
+    if not isinstance(expected_version, str) or not expected_version.strip() or version != expected_version.strip():
+        raise ValueError("Signed launcher version does not match the requested update")
+
+
+def _recover_unhealthy_launcher_update():
+    if not os.path.isfile(LAUNCHER_UPDATE_MARKER):
+        return
+    try:
+        with open(LAUNCHER_UPDATE_MARKER, "r", encoding="utf-8") as f:
+            marker = json.load(f)
+        attempts = int(marker.get("boot_attempts", 0) or 0)
+        if attempts >= 1 and os.path.isfile(LAUNCHER_PREVIOUS_PATH):
+            target = os.path.abspath(__file__)
+            with open(LAUNCHER_PREVIOUS_PATH, "rb") as previous:
+                previous_source = previous.read()
+            _validate_launcher_source_context(previous_source.decode("utf-8"), marker.get("from_version"))
+            compile(previous_source, target, "exec")
+            _atomic_write_bytes(target, previous_source)
+            os.remove(LAUNCHER_UPDATE_MARKER)
+            print("[INFRAVEIL]  Launcher update did not reach a healthy sync; restored the previous signed launcher.", flush=True)
+            os.execl(sys.executable, sys.executable, *sys.argv)
+        marker["boot_attempts"] = attempts + 1
+        _atomic_write_text(LAUNCHER_UPDATE_MARKER, json.dumps(marker, separators=(",", ":"), sort_keys=True))
+    except Exception as exc:
+        print("[INFRAVEIL]  Launcher update recovery check failed: " + str(exc)[:120], flush=True)
+
+def _confirm_launcher_update():
+    if not os.path.isfile(LAUNCHER_UPDATE_MARKER):
+        return
+    try:
+        os.remove(LAUNCHER_UPDATE_MARKER)
+        if os.path.isfile(LAUNCHER_PREVIOUS_PATH):
+            os.remove(LAUNCHER_PREVIOUS_PATH)
+    except Exception:
+        pass
+
+_recover_unhealthy_launcher_update()
+LAUNCHER_CAPABILITIES = [
+    "signed-control-plane-sync",
+    "nonce-backed-machine-requests",
+    "local-runtime-state",
+    "agent-process-supervision",
+    "crash-loop-suspension",
+    "last-known-good-agent-fallback",
+    "health-gated-agent-promotion",
+    "candidate-agent-rollback",
+    "control-plane-degraded-continuity",
+    "remote-stop-restart-clear",
+    "durable-command-results",
+    "orphan-process-cleanup",
+    "atomic-runtime-writes",
+    "encrypted-local-fallback-cache",
+]
+HTTP.headers.update({
+    "User-Agent": f"Infraveil-Launcher/{LAUNCHER_VERSION} (+https://infraveil.com; machine-client)",
+    "Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
+})
+
+def _validate_base_url():
+    try:
+        parsed = urllib.parse.urlparse(BASE_URL)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme == "https":
+            return
+        if parsed.scheme == "http" and host in ("127.0.0.1", "localhost", "::1"):
+            return
+    except Exception:
+        pass
+    raise SystemExit("Infraveil launcher requires HTTPS control-plane traffic outside localhost.")
+
+_validate_base_url()
+
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True, write_through=True)
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(line_buffering=True, write_through=True)
+except Exception:
+    pass
+
+def init_console():
+    global ANSI_ENABLED
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if os.name != "nt":
+        ANSI_ENABLED = sys.stdout.isatty()
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            ANSI_ENABLED = bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    except Exception:
+        ANSI_ENABLED = False
+
+def c(code):
+    return code if ANSI_ENABLED else ""
+
+def _signed_headers(method, path, params=None, body_bytes=b""):
+    timestamp = str(int(time.time()))
+    nonce = uuid.uuid4().hex
+    params = params or {}
+    pairs = []
+    for key in sorted(params.keys()):
+        value = params.get(key)
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                pairs.append((key, str(item)))
+        else:
+            pairs.append((key, str(value)))
+    query = urllib.parse.urlencode(pairs, doseq=True)
+    body_hash = hashlib.sha256(body_bytes or b"").hexdigest()
+    canonical = "\n".join([
+        "REQUEST",
+        method.upper(),
+        path,
+        timestamp,
+        nonce,
+        query,
+        body_hash,
+    ])
+    signature = hmac.new(LAUNCHER_TOKEN.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+    return {
+        "Authorization": f"Bearer {LAUNCHER_TOKEN}",
+        "X-Infraveil-Signature-Version": "2",
+        "X-Infraveil-Timestamp": timestamp,
+        "X-Infraveil-Nonce": nonce,
+        "X-Infraveil-Signature": signature,
+    }
+
+def _signed_post_json(path, payload, timeout=15):
+    body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    headers = _signed_headers("POST", path, body_bytes=body)
+    headers["Content-Type"] = "application/json"
+    request_nonce = headers["X-Infraveil-Nonce"]
+    resolved_timeout = timeout if isinstance(timeout, tuple) else (HTTP_CONNECT_TIMEOUT, timeout)
+    response = HTTP.post(f"{BASE_URL}{path}", headers=headers, data=body, timeout=resolved_timeout)
+    _verify_response_signature(response, request_nonce, path)
+    return response
+
+def _verify_response_signature(response, request_nonce, request_path):
+    request_nonce = str(request_nonce or "").strip()
+    request_path = str(request_path or "").strip()
+    if not request_nonce or not request_path:
+        raise RuntimeError("Control-plane response signature binding missing")
+    version = str(response.headers.get("X-Infraveil-Response-Signature-Version") or "").strip()
+    if version != "2":
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if status_code >= 500:
+            raise RuntimeError(f"Control plane returned unsigned HTTP {status_code}; response rejected")
+        raise RuntimeError("Control-plane response signature version invalid")
+    timestamp = str(response.headers.get("X-Infraveil-Response-Timestamp") or "").strip()
+    signature = str(response.headers.get("X-Infraveil-Response-Signature") or "").strip()
+    if not timestamp or not signature:
+        raise RuntimeError("Control-plane response missing signature")
+    try:
+        ts = int(timestamp)
+    except Exception:
+        raise RuntimeError("Control-plane response has invalid signature timestamp")
+    if abs(int(time.time()) - ts) > 300:
+        raise RuntimeError("Control-plane response signature expired")
+    try:
+        status = str(int(response.status_code))
+    except Exception:
+        raise RuntimeError("Control-plane response has invalid status binding")
+    body_hash = hashlib.sha256(response.content or b"").hexdigest()
+    canonical = "\n".join([
+        "RESPONSE",
+        timestamp,
+        request_nonce,
+        request_path,
+        status,
+        body_hash,
+    ])
+    expected = hmac.new(LAUNCHER_TOKEN.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        raise RuntimeError("Control-plane response signature invalid")
+
+
+def _runtime_cache_key():
+    return hashlib.sha256((LAUNCHER_TOKEN + "|" + CLIENT_ID + "|" + LAUNCHER_HOST_ID).encode("utf-8")).digest()
+
+def _encrypt_runtime_cache_text(text):
+    if not text:
+        return ""
+    aes = AESGCM(_runtime_cache_key())
+    nonce = os.urandom(12)
+    encrypted = aes.encrypt(nonce, text.encode("utf-8"), None)
+    return RUNTIME_CACHE_MAGIC + base64.b64encode(nonce + encrypted).decode("ascii")
+
+def _decrypt_runtime_cache_text(value):
+    if not value:
+        return ""
+    if not isinstance(value, str):
+        return ""
+    if not value.startswith(RUNTIME_CACHE_MAGIC):
+        return ""
+    try:
+        raw = base64.b64decode(value[len(RUNTIME_CACHE_MAGIC):].encode("ascii"))
+        if len(raw) <= 12:
+            return ""
+        aes = AESGCM(_runtime_cache_key())
+        return aes.decrypt(raw[:12], raw[12:], None).decode("utf-8")
+    except Exception:
+        return ""
+
+"""Launcher command-receipt coordination with explicit state and effect hooks.
+
+This importable source module is not yet part of the active runtime assembly.
+Its eventual build-time inline form needs no neighboring customer-side imports.
+It owns receipt admission, acknowledgement replay and terminal tombstones, not
+process execution, caller authorization, state-file locations or signed delivery.
+"""
+
+
+class LauncherCommandState:
+    """Borrow current caller-owned containers; never copy or replace them.
+
+    Create a view after loading persistent state, or at each adapter invocation:
+    legacy state loading can rebind the caller's pending/completed dictionaries.
+    """
+
+    def __init__(self, pending_results, completed_results, held_commands,
+                 protocol, tombstone_limit):
+        self.pending_results = pending_results
+        self.completed_results = completed_results
+        self.held_commands = held_commands
+        self.protocol = protocol
+        self.tombstone_limit = tombstone_limit
+
+
+class LauncherCommandHooks:
+    """Caller-owned effects, retaining their original ordering and exceptions."""
+
+    def __init__(self, persist, audit, log, now):
+        self.persist = persist
+        self.audit = audit
+        self.log = log
+        self.now = now
+
+
+def command_receipt_id(receipt):
+    if not isinstance(receipt, dict):
+        return ""
+    value = receipt.get("command_id")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def command_result_pending(state, receipt):
+    command_id = command_receipt_id(receipt)
+    return bool(command_id and command_id in state.pending_results)
+
+
+def command_result_seen(state, receipt):
+    command_id = command_receipt_id(receipt)
+    return bool(
+        command_id
+        and (command_id in state.pending_results or command_id in state.completed_results)
+    )
+
+
+def command_requires_receipt(state, command):
+    return state.protocol >= 2 and command in {"restart", "update", "clear-workspace"}
+
+
+def begin_command_result(state, hooks, receipt, target_type, target_id, command):
+    command_id = command_receipt_id(receipt)
+    if not command_id:
+        if command_requires_receipt(state, command):
+            held = (str(target_type), str(target_id), str(command))
+            if held not in state.held_commands:
+                state.held_commands.add(held)
+                hooks.log("Held " + str(target_type) + " " + str(command) + " without an exact command receipt; current runtime is unchanged.", level="WARN")
+                hooks.audit("command_held_without_receipt", target_type=target_type, target_id=target_id, command=command)
+            return False
+        return True
+    state.held_commands.discard((str(target_type), str(target_id), str(command)))
+    if command_id in state.pending_results:
+        return False
+    completed = state.completed_results.get(command_id)
+    if isinstance(completed, dict):
+        state.pending_results[command_id] = dict(completed)
+        if not hooks.persist():
+            state.pending_results.pop(command_id, None)
+            raise RuntimeError("Completed command acknowledgement could not be re-queued")
+        return False
+    queue_command_result(state, hooks, receipt, target_type, target_id, command, "accepted")
+    return True
+
+
+def queue_command_result(state, hooks, receipt, target_type, target_id, command, result_state, error=""):
+    command_id = command_receipt_id(receipt)
+    if not command_id:
+        return False
+    result = {
+        "command_id": command_id,
+        "target_type": str(target_type or ""),
+        "target_id": str(target_id or ""),
+        "command": str(command or "").strip().lower(),
+        "state": str(result_state or "").strip().lower(),
+        "error": str(error or "")[:300],
+        "recorded_at": hooks.now(),
+    }
+    previous = state.pending_results.get(command_id)
+    state.pending_results[command_id] = result
+    if not hooks.persist():
+        if previous is None:
+            state.pending_results.pop(command_id, None)
+        else:
+            state.pending_results[command_id] = previous
+        raise RuntimeError("Command acknowledgement could not be persisted")
+    hooks.audit(
+        "command_result_queued",
+        command_id=command_id,
+        target_type=result["target_type"],
+        target_id=result["target_id"],
+        command=result["command"],
+        state=result["state"],
+    )
+    return True
+
+
+def clear_delivered_command_results(state, hooks, sent_results, accepted_command_ids):
+    accepted = {
+        str(command_id)
+        for command_id in (accepted_command_ids or [])
+        if isinstance(command_id, str) and command_id
+    }
+    changed = False
+    for sent in sent_results or []:
+        command_id = str((sent or {}).get("command_id") or "")
+        current = state.pending_results.get(command_id)
+        if command_id in accepted and current == sent and current.get("state") in ("succeeded", "failed"):
+            state.pending_results.pop(command_id, None)
+            state.completed_results[command_id] = dict(current)
+            changed = True
+    if len(state.completed_results) > state.tombstone_limit:
+        ordered = sorted(
+            state.completed_results.items(),
+            key=lambda item: float((item[1] or {}).get("recorded_at", 0) or 0),
+        )
+        for command_id, _result in ordered[:-state.tombstone_limit]:
+            state.completed_results.pop(command_id, None)
+            changed = True
+    if changed and not hooks.persist():
+        raise RuntimeError("Delivered command acknowledgement could not be cleared")
+def _append_local_audit(event, **fields):
+    try:
+        try:
+            if os.path.isfile(AUDIT_PATH) and os.path.getsize(AUDIT_PATH) > AUDIT_MAX_BYTES:
+                os.replace(AUDIT_PATH, AUDIT_PATH + ".1")
+        except Exception:
+            pass
+        entry = {
+            "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "event": event,
+            "launcher_host_id": LAUNCHER_HOST_ID,
+            "client_id": CLIENT_ID,
+            **fields,
+        }
+        with open(AUDIT_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, separators=(",", ":"), sort_keys=True) + "\n")
+        try:
+            os.chmod(AUDIT_PATH, 0o600)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+def _read_local_audit_tail(limit=25):
+    try:
+        if not os.path.isfile(AUDIT_PATH):
+            return []
+        with open(AUDIT_PATH, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()[-limit:]
+        entries = []
+        for line in lines:
+            try:
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    entries.append(item)
+            except Exception:
+                pass
+        return entries
+    except Exception:
+        return []
+
+def _load_runtime_state():
+    global agent_runtime_meta, _pending_cache_purge_ack, _pending_agent_cache_purge_acks
+    global _completed_cache_purge_request_id, _completed_agent_cache_purge_request_ids
+    global _pending_command_results, _completed_command_results
+    try:
+        if os.path.isfile(STATE_PATH):
+            with open(STATE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                agent_runtime_meta = data.get("agents", {}) if isinstance(data.get("agents"), dict) else {}
+                raw_ack = data.get("pending_cache_purge_ack")
+                if (
+                    isinstance(raw_ack, dict)
+                    and isinstance(raw_ack.get("request_id"), str)
+                    and raw_ack.get("request_id").strip()
+                    and raw_ack.get("status") == "succeeded"
+                ):
+                    _pending_cache_purge_ack = {
+                        "request_id": raw_ack["request_id"].strip(),
+                        "status": "succeeded",
+                    }
+                raw_agent_acks = data.get("pending_agent_cache_purge_acks")
+                if isinstance(raw_agent_acks, dict):
+                    _pending_agent_cache_purge_acks = {
+                        str(agent_id): {
+                            "request_id": ack["request_id"].strip(),
+                            "success": True,
+                        }
+                        for agent_id, ack in raw_agent_acks.items()
+                        if (
+                            isinstance(agent_id, str)
+                            and agent_id
+                            and isinstance(ack, dict)
+                            and isinstance(ack.get("request_id"), str)
+                            and ack.get("request_id").strip()
+                            and ack.get("success") is True
+                        )
+                    }
+                completed_id = data.get("completed_cache_purge_request_id")
+                if isinstance(completed_id, str):
+                    _completed_cache_purge_request_id = completed_id.strip()
+                completed_agent_ids = data.get("completed_agent_cache_purge_request_ids")
+                if isinstance(completed_agent_ids, dict):
+                    _completed_agent_cache_purge_request_ids = {
+                        str(agent_id): request_id.strip()
+                        for agent_id, request_id in completed_agent_ids.items()
+                        if isinstance(agent_id, str) and agent_id and isinstance(request_id, str) and request_id.strip()
+                    }
+                raw_command_results = data.get("pending_command_results")
+                if isinstance(raw_command_results, dict):
+                    _pending_command_results = {
+                        str(command_id): dict(result)
+                        for command_id, result in raw_command_results.items()
+                        if (
+                            isinstance(command_id, str)
+                            and command_id.strip()
+                            and isinstance(result, dict)
+                            and result.get("state") in ("accepted", "succeeded", "failed")
+                        )
+                    }
+                    for command_id, result in list(_pending_command_results.items()):
+                        if result.get("state") != "accepted":
+                            continue
+                        if result.get("target_type") == "launcher" and result.get("command") == "restart":
+                            result["state"] = "succeeded"
+                            result["completed_at"] = time.time()
+                        else:
+                            result["state"] = "failed"
+                            result["error"] = "Launcher restarted before it could verify command completion"
+                            result["completed_at"] = time.time()
+                raw_completed_results = data.get("completed_command_results")
+                if isinstance(raw_completed_results, dict):
+                    _completed_command_results = {
+                        str(command_id): dict(result)
+                        for command_id, result in raw_completed_results.items()
+                        if (
+                            isinstance(command_id, str)
+                            and command_id.strip()
+                            and isinstance(result, dict)
+                            and result.get("state") in ("succeeded", "failed")
+                        )
+                    }
+                changed = False
+                for aid, meta in agent_runtime_meta.items():
+                    if not isinstance(meta, dict):
+                        continue
+                    if meta.get("last_payload"):
+                        meta["last_payload"] = ""
+                        changed = True
+                    if meta.get("last_payload_encrypted"):
+                        try:
+                            _atomic_write_text(_payload_cache_path(aid), meta["last_payload_encrypted"])
+                        except Exception:
+                            pass
+                        meta.pop("last_payload_encrypted", None)
+                        changed = True
+                if changed:
+                    _persist_runtime_state()
+                elif raw_command_results is not None:
+                    _persist_runtime_state()
+    except Exception:
+        agent_runtime_meta = {}
+        _pending_cache_purge_ack = {}
+        _pending_agent_cache_purge_acks = {}
+        _completed_cache_purge_request_id = ""
+        _completed_agent_cache_purge_request_ids = {}
+        _pending_command_results = {}
+        _completed_command_results = {}
+
+def _persist_runtime_state():
+    try:
+        payload = {
+            "agents": agent_runtime_meta,
+            "pending_cache_purge_ack": _pending_cache_purge_ack,
+            "pending_agent_cache_purge_acks": _pending_agent_cache_purge_acks,
+            "completed_cache_purge_request_id": _completed_cache_purge_request_id,
+            "completed_agent_cache_purge_request_ids": _completed_agent_cache_purge_request_ids,
+            "pending_command_results": _pending_command_results,
+            "completed_command_results": _completed_command_results,
+            "updated_at": time.time(),
+        }
+        tmp_path = f"{STATE_PATH}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"), sort_keys=True)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, STATE_PATH)
+        try:
+            os.chmod(STATE_PATH, 0o600)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+def _request_with_retries(path, payload, timeout=15, attempts=3, backoff=1.25):
+    last_exc = None
+    for attempt in range(max(1, attempts)):
+        try:
+            return _signed_post_json(path, payload, timeout=timeout)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts - 1:
+                break
+            time.sleep(min(5, backoff * (attempt + 1)))
+    raise last_exc
+
+def _runtime_meta(agent_id):
+    return agent_runtime_meta.setdefault(agent_id, {
+        "crash_times": [],
+        "last_start_at": 0.0,
+        "last_payload": "",
+        "last_payload_encrypted": "",
+        "last_payload_hash": "",
+        "suspended_until": 0.0,
+        "suspension_reason": "",
+        "last_fetch_failure_at": 0.0,
+    })
+
+def _launcher_source_hash():
+    try:
+        with open(os.path.realpath(__file__), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except Exception:
+        return ""
+
+def _host_fingerprint():
+    try:
+        raw = "|".join([
+            socket.gethostname(),
+            platform.system(),
+            platform.release(),
+            platform.machine(),
+            os.path.dirname(os.path.realpath(__file__)),
+        ])
+        return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
+    except Exception:
+        return ""
+
+def _payload_cache_path(agent_id, slot="current"):
+    suffix = "" if slot == "current" else "_" + _safe_agent_slug(slot)
+    return os.path.join(_DATA_DIR, "launcher_payload_" + _safe_agent_slug(agent_id) + suffix + ".cache")
+
+def _record_spawn(agent_id, payload, payload_hash, candidate_version="", persist_state=True):
+    meta = _runtime_meta(agent_id)
+    meta_before = dict(meta)
+    meta["last_start_at"] = time.time()
+    meta["last_payload"] = ""
+    meta.pop("last_payload_encrypted", None)
+    _atomic_write_text(
+        _payload_cache_path(agent_id, "candidate"),
+        _encrypt_runtime_cache_text(payload or ""),
+    )
+    meta["candidate_payload_hash"] = hashlib.sha256((payload or "").encode("utf-8")).hexdigest()
+    meta["candidate_contract_hash"] = payload_hash or ""
+    meta["candidate_version"] = candidate_version or LAUNCHER_VERSION
+    meta["candidate_started_at"] = time.time()
+    meta["candidate_health_ok"] = False
+    meta["candidate_health_observed_at"] = 0.0
+    meta["suspended_until"] = 0.0
+    meta["suspension_reason"] = ""
+    if persist_state and not _persist_runtime_state():
+        meta.clear()
+        meta.update(meta_before)
+        try:
+            os.remove(_payload_cache_path(agent_id, "candidate"))
+        except FileNotFoundError:
+            pass
+        raise RuntimeError("candidate runtime state could not be persisted")
+    _append_local_audit("agent_candidate_started", agent_id=agent_id, version=meta["candidate_version"], source_hash=meta["candidate_payload_hash"])
+
+def _promote_candidate(agent_id):
+    meta = _runtime_meta(agent_id)
+    meta_before = dict(meta)
+    candidate = _payload_cache_path(agent_id, "candidate")
+    current = _payload_cache_path(agent_id)
+    previous = _payload_cache_path(agent_id, "previous")
+    if not os.path.isfile(candidate):
+        return False
+    try:
+        if os.path.isfile(current):
+            shutil.copy2(current, previous)
+        os.replace(candidate, current)
+        meta["last_payload_hash"] = meta.get("candidate_contract_hash", "")
+        promoted_version = meta.get("candidate_version", "")
+        promoted_hash = meta.get("candidate_payload_hash", "")
+        for key in ("candidate_payload_hash", "candidate_contract_hash", "candidate_version", "candidate_started_at", "candidate_health_ok", "candidate_health_observed_at"):
+            meta.pop(key, None)
+        meta["active_runtime_version"] = promoted_version
+        meta["active_source_hash"] = promoted_hash
+        meta["blocked_runtime_version"] = ""
+        meta["last_promoted_at"] = time.time()
+        if not _persist_runtime_state():
+            meta.clear()
+            meta.update(meta_before)
+            raise RuntimeError("promoted runtime state could not be persisted")
+        _append_local_audit("agent_candidate_promoted", agent_id=agent_id, version=promoted_version, source_hash=promoted_hash)
+        return True
+    except Exception as exc:
+        _append_local_audit("agent_candidate_promotion_failed", agent_id=agent_id, error=str(exc)[:200])
+        return False
+
+def _rollback_candidate(agent_id, name):
+    meta = _runtime_meta(agent_id)
+    failed_version = str(meta.get("candidate_version") or "")
+    failed_hash = str(meta.get("candidate_payload_hash") or "")
+    meta["candidate_command_outcome"] = "failed"
+    candidate = _payload_cache_path(agent_id, "candidate")
+    previous = _payload_cache_path(agent_id, "previous")
+    current = _payload_cache_path(agent_id)
+    try:
+        if os.path.isfile(candidate):
+            os.remove(candidate)
+        else:
+            current_payload = None
+            if os.path.isfile(current):
+                try:
+                    with open(current, "r", encoding="utf-8") as cache_file:
+                        current_payload = _decrypt_runtime_cache_text(cache_file.read())
+                except Exception:
+                    current_payload = None
+            current_hash = hashlib.sha256((current_payload or "").encode("utf-8")).hexdigest() if current_payload is not None else ""
+            if current_hash and failed_hash and hmac.compare_digest(current_hash, failed_hash):
+                if not os.path.isfile(previous):
+                    raise RuntimeError("last-known-good cache is missing after partial promotion")
+                os.replace(previous, current)
+        with open(current, "r", encoding="utf-8") as cache_file:
+            restored_payload = _decrypt_runtime_cache_text(cache_file.read())
+        restored_hash = hashlib.sha256((restored_payload or "").encode("utf-8")).hexdigest() if restored_payload is not None else ""
+        if not restored_payload or (failed_hash and hmac.compare_digest(restored_hash, failed_hash)):
+            raise RuntimeError("rollback cache still contains the blocked candidate")
+    except Exception as exc:
+        _append_local_audit(
+            "agent_candidate_rollback_failed",
+            agent_id=agent_id,
+            version=failed_version,
+            error=str(exc)[:200],
+        )
+        return False
+    for key in ("candidate_payload_hash", "candidate_contract_hash", "candidate_version", "candidate_started_at", "candidate_health_ok", "candidate_health_observed_at"):
+        meta.pop(key, None)
+    meta["blocked_runtime_version"] = failed_version
+    meta["last_rollback_at"] = time.time()
+    meta["rollback_count"] = int(meta.get("rollback_count", 0) or 0) + 1
+    if not _persist_runtime_state():
+        _append_local_audit("agent_candidate_rollback_failed", agent_id=agent_id, version=failed_version, error="rollback state persistence failed")
+        return False
+    restored = _spawn_from_cached_payload(agent_id, name)
+    _append_local_audit("agent_candidate_rolled_back", agent_id=agent_id, version=failed_version, restored=restored)
+    if restored:
+        log_agent("ROLLED BACK", agent_id, name, f"candidate {failed_version} failed health gate; restored last known good", level="WARN")
+    return restored
+
+def _reject_agent_candidate(agent_id, name, reason):
+    meta = _runtime_meta(agent_id)
+    failed_version = str(meta.get("candidate_version") or "")
+    if not kill_agent(agent_id, name, reason=reason, wait_for_ports=True):
+        _append_local_audit("agent_candidate_containment_failed", agent_id=agent_id, reason=reason)
+        return False
+    recovered = _rollback_candidate(agent_id, name)
+    if not recovered:
+        # A first install has no known-good cache. Do not keep a dead candidate
+        # pending forever, or retry a failing start without the normal budget.
+        for key in ("candidate_payload_hash", "candidate_contract_hash", "candidate_version", "candidate_started_at", "candidate_health_ok", "candidate_health_observed_at"):
+            meta.pop(key, None)
+        meta["blocked_runtime_version"] = failed_version
+        _record_crash(agent_id)
+    receipt = meta.get("candidate_command_receipt")
+    if isinstance(receipt, dict):
+        _queue_command_result(receipt, "agent", agent_id, str(receipt.get("command") or "restart"), "failed",
+                              "Candidate failed verification; previous verified cache restored" if recovered else "Candidate failed verification; no previous runtime could be restored")
+        meta.pop("candidate_command_receipt", None)
+        meta.pop("candidate_command_outcome", None)
+    _persist_runtime_state()
+    return recovered
+
+
+def _promote_healthy_candidates():
+    now = time.time()
+    for agent_id, meta in list(agent_runtime_meta.items()):
+        proc = agents.get(agent_id)
+        meta = _runtime_meta(agent_id)
+        receipt = meta.get("candidate_command_receipt")
+        if isinstance(receipt, dict) and meta.get("candidate_command_outcome") and (meta.get("candidate_command_outcome") == "failed" or meta.get("command_runtime_ready") is True):
+            outcome = str(meta.get("candidate_command_outcome"))
+            try:
+                _queue_command_result(receipt, "agent", agent_id, str(receipt.get("command") or "restart"), outcome,
+                                      "Candidate failed verification; recovery to the previous cache was attempted" if outcome == "failed" else "")
+                meta.pop("candidate_command_receipt", None)
+                meta.pop("candidate_command_outcome", None)
+                _persist_runtime_state()
+            except Exception as exc:
+                _append_local_audit("candidate_command_result_deferred", agent_id=agent_id, error=str(exc)[:200])
+        started = float(meta.get("candidate_started_at", 0) or 0)
+        if not (meta.get("candidate_version") and started):
+            continue
+        if proc is None or proc.poll() is not None:
+            _reject_agent_candidate(agent_id, agent_names.get(agent_id, agent_id), "candidate-exited")
+            continue
+        observed_at = float(meta.get("candidate_health_observed_at", 0) or 0)
+        if now - started >= AGENT_CANDIDATE_HEALTH_SECONDS and meta.get("candidate_health_ok") is True and observed_at >= started and now - observed_at < 60:
+            if _promote_candidate(agent_id):
+                if isinstance(meta.get("candidate_command_receipt"), dict):
+                    meta["candidate_command_outcome"] = "succeeded"
+                    _persist_runtime_state()
+            else:
+                name = agent_names.get(agent_id, agent_id)
+                _reject_agent_candidate(agent_id, name, "candidate-promotion-failed")
+        elif now - started >= AGENT_CANDIDATE_HEALTH_SECONDS + 60:
+            name = agent_names.get(agent_id, agent_id)
+            _reject_agent_candidate(agent_id, name, "candidate-health-failed")
+
+def _record_crash(agent_id):
+    meta = _runtime_meta(agent_id)
+    now = time.time()
+    kept = [ts for ts in meta.get("crash_times", []) if now - ts < AGENT_RESPAWN_WINDOW_SECONDS]
+    kept.append(now)
+    meta["crash_times"] = kept
+    if len(kept) >= AGENT_RESPAWN_MAX_ATTEMPTS:
+        meta["suspended_until"] = now + AGENT_RESPAWN_WINDOW_SECONDS
+        meta["suspension_reason"] = f"crash-loop:{len(kept)}"
+        _persist_runtime_state()
+        _append_local_audit("agent_crash_loop_suspended", agent_id=agent_id, crash_count=len(kept), suspended_until=meta["suspended_until"])
+        return False
+    _persist_runtime_state()
+    return True
+
+def _can_attempt_start(agent_id):
+    meta = _runtime_meta(agent_id)
+    suspended_until = float(meta.get("suspended_until", 0) or 0)
+    if suspended_until and time.time() < suspended_until:
+        return False, int(max(1, suspended_until - time.time())), meta.get("suspension_reason", "suspended")
+    if suspended_until and time.time() >= suspended_until:
+        meta["suspended_until"] = 0.0
+        meta["suspension_reason"] = ""
+        meta["crash_times"] = []
+        _persist_runtime_state()
+    return True, 0, ""
+
+def _clear_runtime_meta(agent_id):
+    meta = _runtime_meta(agent_id)
+    meta["crash_times"] = []
+    meta["suspended_until"] = 0.0
+    meta["suspension_reason"] = ""
+    _persist_runtime_state()
+
+def _purge_agent_runtime_cache(agent_id, name="unnamed"):
+    try:
+        if agent_id in agents:
+            if not kill_agent(agent_id, name=name, reason="cache-purge"):
+                return False
+        cache_paths = [_payload_cache_path(agent_id, slot) for slot in ("current", "candidate", "previous")]
+        cache_paths.append(get_agent_filepath(agent_id))
+        for cache_path in cache_paths:
+            if os.path.isfile(cache_path):
+                os.remove(cache_path)
+        if any(os.path.exists(cache_path) for cache_path in cache_paths) or agent_id in agents:
+            return False
+        agent_runtime_meta.pop(agent_id, None)
+        _append_local_audit("agent_runtime_cache_purged", agent_id=agent_id, name=name)
+        return True
+    except Exception as exc:
+        _append_local_audit("agent_runtime_cache_purge_failed", agent_id=agent_id, name=name, error=str(exc)[:200])
+        return False
+
+def _purge_launcher_runtime_cache():
+    try:
+        if not shutdown_all_agents(reason="cache-purge"):
+            return False
+        if not cleanup_orphaned_runtime_processes():
+            return False
+        cleanup_agent_artifacts()
+        for filename in os.listdir(_DATA_DIR):
+            if filename.startswith("launcher_payload_") and filename.endswith(".cache"):
+                os.remove(os.path.join(_DATA_DIR, filename))
+        remaining = [
+            filename
+            for filename in os.listdir(_DATA_DIR)
+            if filename.startswith("launcher_payload_") and filename.endswith(".cache")
+        ]
+        if agents or remaining:
+            return False
+        agent_runtime_meta.clear()
+        _append_local_audit("launcher_runtime_cache_purged")
+        return True
+    except Exception as exc:
+        _append_local_audit("launcher_runtime_cache_purge_failed", error=str(exc)[:200])
+        return False
+
+def _clear_delivered_cache_purge_acks(sent_cache_ack, sent_agent_acks):
+    global _pending_cache_purge_ack, _pending_agent_cache_purge_acks
+    changed = False
+    if sent_cache_ack and _pending_cache_purge_ack == sent_cache_ack:
+        _pending_cache_purge_ack = {}
+        changed = True
+    for agent_id, sent_ack in (sent_agent_acks or {}).items():
+        if _pending_agent_cache_purge_acks.get(agent_id) == sent_ack:
+            _pending_agent_cache_purge_acks.pop(agent_id, None)
+            changed = True
+    if changed:
+        _persist_runtime_state()
+
+
+def _launcher_command_state():
+    return LauncherCommandState(
+        _pending_command_results, _completed_command_results,
+        _held_receiptless_commands, _command_delivery_protocol,
+        COMMAND_RESULT_TOMBSTONE_LIMIT)
+
+
+def _launcher_command_hooks():
+    return LauncherCommandHooks(_persist_runtime_state, _append_local_audit, log, time.time)
+
+
+def _command_receipt_id(receipt):
+    return command_receipt_id(receipt)
+
+
+def _command_result_pending(receipt):
+    return command_result_pending(_launcher_command_state(), receipt)
+
+
+def _command_result_seen(receipt):
+    return command_result_seen(_launcher_command_state(), receipt)
+
+
+def _command_requires_receipt(command):
+    return command_requires_receipt(_launcher_command_state(), command)
+
+
+def _begin_command_result(receipt, target_type, target_id, command):
+    return begin_command_result(_launcher_command_state(), _launcher_command_hooks(),
+                                receipt, target_type, target_id, command)
+
+
+def _queue_command_result(receipt, target_type, target_id, command, state, error=""):
+    return queue_command_result(_launcher_command_state(), _launcher_command_hooks(),
+                                receipt, target_type, target_id, command, state, error)
+
+
+def _clear_delivered_command_results(sent_results, accepted_command_ids):
+    return clear_delivered_command_results(_launcher_command_state(), _launcher_command_hooks(),
+                                          sent_results, accepted_command_ids)
+
+def _spawn_from_cached_payload(agent_id, name):
+    meta = _runtime_meta(agent_id)
+    enc = ""
+    try:
+        cp = _payload_cache_path(agent_id)
+        if os.path.isfile(cp):
+            with open(cp, "r", encoding="utf-8") as f:
+                enc = f.read()
+    except Exception:
+        enc = ""
+    if not enc:
+        enc = meta.get("last_payload_encrypted") or ""
+    payload = _decrypt_runtime_cache_text(enc)
+    if not payload:
+        return False
+    try:
+        _require_agent_source_security_epoch(payload)
+        spawn_agent(
+            agent_id,
+            payload,
+            name=name,
+            payload_hash=meta.get("last_payload_hash"),
+            stage_candidate=False,
+            persist_state=not _progress.active,
+        )
+        log_agent("FALLBACK", agent_id, name, "using last known good payload", level="WARN")
+        return True
+    except Exception as exc:
+        log_agent("SPAWN ERROR", agent_id, name, str(exc)[:80], level="ERR")
+        return False
+_print_lock = threading.Lock()
+
+def _emit_line(text):
+    if _progress.active and _progress.tty:
+        _progress.print_line(text)
+    else:
+        with _print_lock:
+            print(text, flush=True)
+
+def log(msg, level="INFO"):
+    ts = datetime.now().strftime('%H:%M:%S')
+    colors = {"INFO": "\x1b[94m", "OK": "\x1b[92m", "WARN": "\x1b[93m", "ERR": "\x1b[91m"}
+    col = colors.get(level, "\x1b[94m")
+    _emit_line(f"{c(ANSI_GREY)}{ts}{c(ANSI_RESET)}  {c(col)}[INFRAVEIL]{c(ANSI_RESET)}  {msg}")
+
+def log_agent(label, agent_id, name, extra="", level="INFO"):
+    short = agent_id[:8]
+    colors = {"INFO": "\x1b[94m", "OK": "\x1b[92m", "WARN": "\x1b[93m", "ERR": "\x1b[91m"}
+    col = colors.get(level, "\x1b[94m")
+    tag = f"{c(ANSI_GREY)}[{short}]{c(ANSI_RESET)}"
+    nm  = f"{c(ANSI_WHITE)}{name}{c(ANSI_RESET)}"
+    ex  = f"  {c(ANSI_GREY)}{extra}{c(ANSI_RESET)}" if extra else ""
+    ts  = datetime.now().strftime('%H:%M:%S')
+    _emit_line(f"{c(ANSI_GREY)}{ts}{c(ANSI_RESET)}  {c(col)}{label:<14}{c(ANSI_RESET)}  {tag} {nm}{ex}")
+
+class _Progress:
+    _PHASES = (("fetch", "Fetch"), ("decrypt", "Decrypt"), ("start", "Start"))
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.active = False
+        self.tty = False
+        self.total = 0
+        self.counts = {"fetch": 0, "decrypt": 0, "start": 0}
+        self.failed = 0
+        self._height = 0
+        self._t0 = 0.0
+        self._stop = False
+        self._thread = None
+        self._ms = {"fetch": 0, "decrypt": 0, "start": 0}
+
+    def begin(self, total, verb="Deploying"):
+        with self._lock:
+            if self.active:
+                return
+            self.total = max(1, int(total))
+            self.counts = {"fetch": 0, "decrypt": 0, "start": 0}
+            self.failed = 0
+            self._height = 0
+            self._t0 = time.time()
+            self._stop = False
+            self._ms = {"fetch": 0, "decrypt": 0, "start": 0}
+            self.tty = bool(ANSI_ENABLED and sys.stdout and sys.stdout.isatty())
+            self.active = True
+        log(f"{verb} {self.total} workload" + ("s" if self.total != 1 else "") + "...", level="INFO")
+        if self.tty:
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+
+    def tick(self, key, n=1):
+        due = []
+        with self._lock:
+            if not self.active:
+                return
+            if key == "fail":
+                self.failed += n
+            elif key in self.counts:
+                self.counts[key] += n
+            if not self.tty:
+                due = self._milestones_locked()
+        for line in due:
+            log(line, level="INFO")
+
+    def _milestones_locked(self):
+        out = []
+        step = max(1, self.total // 4)
+        for k, label in self._PHASES:
+            done = self.counts[k]
+            target = done - (done % step) if done < self.total else self.total
+            if target > self._ms[k]:
+                self._ms[k] = target
+                out.append(f"{label}: {target}/{self.total}")
+        return out
+
+    def _bar(self, done, width=22):
+        f = int(width * min(done, self.total) / self.total)
+        return c("\x1b[92m") + "█" * f + c(ANSI_GREY) + "░" * (width - f) + c(ANSI_RESET)
+
+    def _frame(self):
+        lines = ["", "  " + c(ANSI_WHITE) + "INFRAVEIL" + c(ANSI_RESET) + c(ANSI_GREY) + f"   {self.total} workloads" + c(ANSI_RESET), ""]
+        for k, label in self._PHASES:
+            done = self.counts[k]
+            lines.append("   " + c(ANSI_GREY) + f"{label:<8}" + c(ANSI_RESET) + " " + self._bar(done) + c(ANSI_GREY) + f"  {done:>4}/{self.total}" + c(ANSI_RESET))
+        elapsed = time.time() - self._t0
+        tail = "   " + c("\x1b[92m") + f"{self.counts['start']} online" + c(ANSI_RESET)
+        if self.failed:
+            tail += c(ANSI_GREY) + "  -  " + c("\x1b[91m") + f"{self.failed} failed" + c(ANSI_RESET)
+        tail += c(ANSI_GREY) + f"  -  {elapsed:.0f}s" + c(ANSI_RESET)
+        lines.append(tail)
+        return lines
+
+    def _draw(self):
+        lines = self._frame()
+        with _print_lock:
+            buf = (f"\033[{self._height}A" if self._height else "") + "\033[J" + "\n".join(lines) + "\n"
+            sys.stdout.write(buf)
+            sys.stdout.flush()
+            self._height = len(lines)
+
+    def _loop(self):
+        while True:
+            with self._lock:
+                if self._stop:
+                    break
+            try:
+                self._draw()
+            except Exception:
+                pass
+            time.sleep(0.12)
+
+    def print_line(self, text):
+        with _print_lock:
+            buf = ""
+            if self.active and self.tty and self._height:
+                buf += f"\033[{self._height}A\033[J"
+                self._height = 0
+            sys.stdout.write(buf + text + "\n")
+            sys.stdout.flush()
+
+    def end(self):
+        with self._lock:
+            if not self.active:
+                return
+            self._stop = True
+            self.active = False
+            elapsed = time.time() - self._t0
+            online = self.counts["start"]
+            total = self.total
+            failed = self.failed
+        if self._thread:
+            self._thread.join(timeout=0.4)
+        if self.tty:
+            try:
+                self._draw()
+            except Exception:
+                pass
+        msg = f"{online}/{total} workloads online in {elapsed:.0f}s"
+        if failed:
+            msg += f"  ({failed} failed)"
+        log(msg, level="OK" if not failed else "WARN")
+
+_progress = _Progress()
+
+def _interactive():
+    if NONINTERACTIVE or os.environ.get("INFRAVEIL_NONINTERACTIVE"):
+        return False
+    try:
+        return bool(sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty())
+    except Exception:
+        return False
+
+def _load_onboarding():
+    try:
+        if os.path.isfile(ONBOARD_PATH):
+            with open(ONBOARD_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return None
+
+def _save_onboarding(answers):
+    try:
+        answers = dict(answers or {})
+        answers.setdefault("version", LAUNCHER_VERSION)
+        answers["onboarded_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        _atomic_write_text(ONBOARD_PATH, json.dumps(answers, indent=2, sort_keys=True))
+    except Exception:
+        pass
+
+def _ask_yes_no(question, default=True):
+    suffix = " [Y/n] " if default else " [y/N] "
+    try:
+        resp = input("  " + question + suffix).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return default
+    if not resp:
+        return default
+    return resp in ("y", "yes")
+
+def _ask_text(question, default=""):
+    try:
+        resp = input("  " + question + " ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return default
+    return resp or default
+
+def _node_install_hint():
+    s = platform.system().lower()
+    if s == "windows":
+        return "winget install OpenJS.NodeJS.LTS   (or download: https://nodejs.org/en/download)"
+    if s == "darwin":
+        return "brew install node   (or download: https://nodejs.org/en/download)"
+    return "sudo apt-get install -y nodejs npm   (Debian/Ubuntu), or use nvm (https://github.com/nvm-sh/nvm)"
+
+def _shell_single_quote(value):
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+def _macos_supervisor_source(python_cmd, script_path):
+    source = r"""#!/bin/sh
+umask 077
+
+PYTHON_CMD=__PYTHON_CMD__
+SCRIPT_PATH=__SCRIPT_PATH__
+STATE_DIR=__STATE_DIR__
+STATE_PATH="$STATE_DIR/launcher_start_budget.macos"
+LOCK_PATH="$STATE_DIR/launcher_start_budget.macos.lock"
+TEMP_PATH=""
+LOCK_ACQUIRED=0
+
+cleanup() {
+    if [ -n "$TEMP_PATH" ]; then
+        /bin/rm -f "$TEMP_PATH" 2>/dev/null || true
+    fi
+    if [ "$LOCK_ACQUIRED" -eq 1 ]; then
+        /bin/rmdir "$LOCK_PATH" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+fail_closed() {
+    detail=$1
+    /bin/echo "[INFRAVEIL]  Supervised launcher start blocked because the restart guard state could not be safely read or updated ($detail). The service will stop retrying. Review $STATE_PATH, fix its ownership/permissions or malformed contents, then start the service again. Manual launcher runs remain available without INFRAVEIL_NONINTERACTIVE=1."
+    exit 0
+}
+
+if [ -L "$STATE_DIR" ] || { [ -e "$STATE_DIR" ] && [ ! -d "$STATE_DIR" ]; }; then
+    fail_closed "restart guard directory is not a regular directory"
+fi
+/bin/mkdir -p "$STATE_DIR" 2>/dev/null || fail_closed "restart guard directory is not writable"
+/bin/chmod 700 "$STATE_DIR" 2>/dev/null || fail_closed "restart guard directory permissions could not be secured"
+
+attempt=0
+while ! /bin/mkdir "$LOCK_PATH" 2>/dev/null; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 50 ]; then
+        fail_closed "restart guard lock remained busy"
+    fi
+    /bin/sleep 0.1
+done
+LOCK_ACQUIRED=1
+
+if [ -L "$STATE_PATH" ] || { [ -e "$STATE_PATH" ] && [ ! -f "$STATE_PATH" ]; }; then
+    fail_closed "restart guard state is not a regular file"
+fi
+if [ -e "$STATE_PATH" ]; then
+    /bin/chmod 600 "$STATE_PATH" 2>/dev/null || fail_closed "restart guard state permissions could not be secured"
+fi
+
+NOW=$(/bin/date +%s 2>/dev/null) || fail_closed "system clock could not be read"
+case "$NOW" in
+    ""|*[!0-9]*) fail_closed "system clock is invalid" ;;
+esac
+NOW_LENGTH=$(printf '%s' "$NOW" | /usr/bin/wc -c) || fail_closed "system clock is invalid"
+if [ "$NOW_LENGTH" -gt 18 ]; then
+    fail_closed "system clock is invalid"
+fi
+CUTOFF=$((NOW - 300))
+TEMP_PATH="$STATE_PATH.tmp.$$"
+if [ -e "$TEMP_PATH" ] || [ -L "$TEMP_PATH" ]; then
+    fail_closed "restart guard temporary state already exists"
+fi
+(umask 077 && : > "$TEMP_PATH") 2>/dev/null || fail_closed "restart guard state is not writable"
+
+COUNT=0
+if [ -e "$STATE_PATH" ]; then
+    SAW_STATE_LINE=0
+    while IFS= read -r stamp || [ -n "$stamp" ]; do
+        SAW_STATE_LINE=1
+        case "$stamp" in
+            ""|*[!0-9]*) fail_closed "restart guard start history is malformed" ;;
+            0) ;;
+            0*) fail_closed "restart guard start history is malformed" ;;
+        esac
+        STAMP_LENGTH=$(printf '%s' "$stamp" | /usr/bin/wc -c) || fail_closed "restart guard start history is malformed"
+        if [ "$STAMP_LENGTH" -gt 18 ]; then
+            fail_closed "restart guard start history is malformed"
+        fi
+        if [ "$stamp" -gt "$NOW" ]; then
+            stamp=$NOW
+        fi
+        if [ "$stamp" -gt "$CUTOFF" ]; then
+            printf '%s\n' "$stamp" >> "$TEMP_PATH" || fail_closed "restart guard state is not writable"
+            COUNT=$((COUNT + 1))
+        fi
+    done < "$STATE_PATH"
+    if [ "$SAW_STATE_LINE" -eq 0 ]; then
+        fail_closed "restart guard start history is malformed"
+    fi
+fi
+
+if [ "$COUNT" -ge 5 ]; then
+    /bin/echo "[INFRAVEIL]  Supervised launcher restart budget exhausted: 5 starts were admitted within 300 seconds. The service will stop retrying. Review the launcher logs and configuration, then start the service again after the window expires. Manual launcher runs remain available without INFRAVEIL_NONINTERACTIVE=1."
+    exit 0
+fi
+
+printf '%s\n' "$NOW" >> "$TEMP_PATH" || fail_closed "restart guard state is not writable"
+/bin/chmod 600 "$TEMP_PATH" 2>/dev/null || fail_closed "restart guard state permissions could not be secured"
+/bin/mv -f "$TEMP_PATH" "$STATE_PATH" 2>/dev/null || fail_closed "restart guard state could not be committed"
+TEMP_PATH=""
+if ! /bin/rmdir "$LOCK_PATH" 2>/dev/null; then
+    fail_closed "restart guard lock could not be released"
+fi
+LOCK_ACQUIRED=0
+
+if [ ! -x "$PYTHON_CMD" ]; then
+    /bin/echo "[INFRAVEIL]  Configured launcher Python is missing or not executable: $PYTHON_CMD"
+    exit 1
+fi
+
+INFRAVEIL_START_GUARD_ADMITTED=1
+export INFRAVEIL_START_GUARD_ADMITTED
+exec "$PYTHON_CMD" -I -u "$SCRIPT_PATH" --noninteractive
+/bin/echo "[INFRAVEIL]  Could not execute the supervised launcher."
+exit 1
+"""
+    return (
+        source.replace("__PYTHON_CMD__", _shell_single_quote(python_cmd))
+        .replace("__SCRIPT_PATH__", _shell_single_quote(script_path))
+        .replace("__STATE_DIR__", _shell_single_quote(_DATA_DIR))
+    )
+
+def _systemd_path_argument(value, executable=False):
+    value = str(value)
+    if not value or any(character in value for character in ("\x00", "\n", "\r")):
+        raise ValueError("Invalid systemd executable or directory path")
+    value = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    if executable:
+        value = value.replace("$", "$$")
+    return '"' + value + '"'
+
+
+def _systemd_working_directory_argument(value):
+    value = str(value)
+    if not value.startswith("/") or any(
+        ord(character) < 0x20 or 0x7f <= ord(character) <= 0x9f
+        for character in value
+    ):
+        raise ValueError("Invalid absolute systemd working directory path")
+    # WorkingDirectory consumes a raw path, unlike the quoted ExecStart words.
+    # Keep trailing spaces and backslashes inside the value, away from line ends.
+    return (value.rstrip("/") + "/.").replace("%", "%%")
+
+
+def _launcher_systemd_state():
+    result = subprocess.run(
+        ["systemctl", "show", "--no-pager",
+         "--property=LoadState,FragmentPath,UnitFileState,DropInPaths", "infraveil-launcher.service"],
+        capture_output=True, text=True, check=False, timeout=20,
+    )
+    if result.returncode not in (0, 1):
+        raise RuntimeError("Could not inspect the existing systemd launcher")
+    properties = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key in properties:
+            raise RuntimeError("Ambiguous systemd launcher properties")
+        properties[key] = value
+    if set(properties) != {"LoadState", "FragmentPath", "UnitFileState", "DropInPaths"}:
+        raise RuntimeError("Incomplete systemd launcher properties")
+    if result.returncode and properties["LoadState"] != "not-found":
+        raise RuntimeError("Could not inspect the existing systemd launcher")
+    return properties
+
+
+def _check_launcher_unit_owner(unit_path, unit, legacy_unit):
+    """Only our exact same-install unit may be retained or repaired.
+
+    A different installation, drop-in, mask, or customized unit needs explicit
+    operator review; enrollment is not authority to replace another service.
+    """
+    if not os.path.lexists(unit_path):
+        return False
+    if os.path.islink(unit_path) or not os.path.isfile(unit_path):
+        raise RuntimeError("Existing launcher unit is linked or not a regular file")
+    info = os.stat(unit_path)
+    if info.st_uid != 0 or info.st_nlink != 1 or info.st_mode & 0o022:
+        raise RuntimeError("Existing launcher unit has unexpected ownership or permissions")
+    with open(unit_path, "r", encoding="utf-8") as stream:
+        existing = stream.read(65537)
+    if len(existing) > 65536 or existing not in (unit, legacy_unit):
+        raise RuntimeError("Existing launcher belongs to another installation or was customized")
+    return True
+
+
+def _register_boot_service(python_cmd, script_path):
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    try:
+        if os.name == "nt":
+            startup = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+            if not os.path.isdir(startup):
+                return False, "Could not find the Windows Startup folder; set autostart up later. The launcher still runs now.", False
+            run_cmd = python_cmd
+            if python_cmd.lower().endswith("python.exe"):
+                pyw = python_cmd[:-len("python.exe")] + "pythonw.exe"
+                if os.path.isfile(pyw):
+                    run_cmd = pyw
+            cmd_path = os.path.join(startup, "InfraveilLauncher.cmd")
+            content = '@echo off\ncd /d "%s"\nstart "" "%s" "%s"\n' % (script_dir, run_cmd, script_path)
+            _atomic_write_text(cmd_path, content)
+            return True, 'Registered autostart at logon (Startup folder \\ InfraveilLauncher.cmd). Delete that file to disable.', False
+        if platform.system().lower() == "darwin":
+            label_suffix = re.sub(r"[^A-Za-z0-9.-]+", "-", LAUNCHER_HOST_ID or CLIENT_ID).strip(".-") or "default"
+            label = "com.infraveil.launcher." + label_suffix
+            launch_agents_dir = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents")
+            os.makedirs(launch_agents_dir, mode=0o700, exist_ok=True)
+            plist_path = os.path.join(launch_agents_dir, label + ".plist")
+            log_dir = os.path.join(_DATA_DIR, "logs")
+            os.makedirs(log_dir, mode=0o700, exist_ok=True)
+            supervisor_path = os.path.join(_DATA_DIR, "launcher_supervisor.sh")
+            _atomic_write_text(supervisor_path, _macos_supervisor_source(python_cmd, script_path))
+            os.chmod(supervisor_path, 0o700)
+            service_path = ":".join([
+                os.path.join(os.path.expanduser("~"), ".local", "bin"),
+                "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+            ])
+            plist = {
+                "Label": label,
+                "ProgramArguments": ["/bin/sh", supervisor_path],
+                "WorkingDirectory": script_dir,
+                "EnvironmentVariables": {
+                    "INFRAVEIL_NONINTERACTIVE": "1",
+                    "INFRAVEIL_TRUST_CONSOLE_RUNTIME": "1",
+                    "PATH": service_path,
+                },
+                "RunAtLoad": True,
+                "KeepAlive": {"SuccessfulExit": False},
+                "ThrottleInterval": 10,
+                "ProcessType": "Background",
+                "Umask": 0o077,
+                "StandardOutPath": os.path.join(log_dir, "launcher.stdout.log"),
+                "StandardErrorPath": os.path.join(log_dir, "launcher.stderr.log"),
+            }
+            _atomic_write_text(plist_path, plistlib.dumps(plist, fmt=plistlib.FMT_XML, sort_keys=True).decode("utf-8"))
+            os.chmod(plist_path, 0o600)
+            domain = "gui/" + str(os.getuid())
+            service = domain + "/" + label
+            loaded = subprocess.call(
+                ["launchctl", "print", service],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ) == 0
+            if not loaded:
+                subprocess.check_call(["launchctl", "bootstrap", domain, plist_path], timeout=20)
+            subprocess.check_call(["launchctl", "enable", service], timeout=20)
+            return True, "Registered macOS LaunchAgent " + label + " (starts at login with bounded failure restarts).", True
+        uid, gid = os.getuid(), os.getgid()
+        if uid == 0 or gid == 0:
+            return False, "Automatic Linux service setup requires a non-root account. Run setup as the intended service user, or provision a reviewed privileged service with root-owned executable paths.", False
+        unit = "\n".join([
+            "[Unit]", "Description=Infraveil Launcher",
+            "After=network-online.target", "Wants=network-online.target",
+            "StartLimitIntervalSec=300", "StartLimitBurst=5", "",
+            "[Service]", "Type=simple", "User=" + str(uid), "Group=" + str(gid),
+            "UMask=0077", "NoNewPrivileges=true", "KillMode=control-group",
+            "WorkingDirectory=" + _systemd_working_directory_argument(script_dir),
+            "ExecStart=" + _systemd_path_argument(python_cmd, executable=True) + " -I " + _systemd_path_argument(script_path, executable=True),
+            "Restart=on-failure", "RestartSec=10", "Environment=INFRAVEIL_NONINTERACTIVE=1", "",
+            "[Install]", "WantedBy=multi-user.target", ""])
+        unit_path = "/etc/systemd/system/infraveil-launcher.service"
+        legacy_unit = unit.replace(
+            "WorkingDirectory=" + _systemd_working_directory_argument(script_dir),
+            "WorkingDirectory=" + _systemd_path_argument(script_dir), 1,
+        )
+        existing = _check_launcher_unit_owner(unit_path, unit, legacy_unit)
+        before = _launcher_systemd_state()
+        if (before["FragmentPath"] not in ("", unit_path)
+                or before["LoadState"] == "masked" or before["DropInPaths"]):
+            raise RuntimeError("A different or masked launcher service requires operator review")
+        if not existing and (before["FragmentPath"] or before["LoadState"] != "not-found"):
+            raise RuntimeError("Existing launcher state does not match the selected installation")
+        tmp = os.path.join(script_dir, ".infraveil-launcher.service")
+        try:
+            _atomic_write_text(tmp, unit)
+            checked = subprocess.run(
+                ["systemd-analyze", "verify", "--man=no", "--no-pager", tmp],
+                capture_output=True, text=True, check=False, timeout=20,
+            )
+            if checked.returncode != 0:
+                raise RuntimeError("systemd rejected the generated launcher unit; no unit was installed")
+            # The system directory is root-owned. Recheck our exact expected
+            # predecessor immediately before invoking the normal sudo prompt.
+            if _check_launcher_unit_owner(unit_path, unit, legacy_unit) != existing:
+                raise RuntimeError("Launcher service changed during registration")
+            subprocess.check_call(["sudo", "-n", "cp", tmp, unit_path], timeout=20)
+            _check_launcher_unit_owner(unit_path, unit, unit)
+            subprocess.check_call(["sudo", "-n", "systemctl", "daemon-reload"], timeout=20)
+            loaded = _launcher_systemd_state()
+            if (loaded["LoadState"] != "loaded" or loaded["FragmentPath"] != unit_path
+                    or loaded["DropInPaths"]):
+                raise RuntimeError("Installed launcher unit did not load; autostart is not verified")
+            subprocess.check_call(["sudo", "-n", "systemctl", "enable", "infraveil-launcher.service"], timeout=20)
+            enabled = _launcher_systemd_state()
+            if (enabled["LoadState"] != "loaded" or enabled["FragmentPath"] != unit_path
+                    or enabled["UnitFileState"] != "enabled" or enabled["DropInPaths"]):
+                raise RuntimeError("Launcher unit is not persistently enabled; autostart is not verified")
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return True, "Launcher unit loaded and enabled for boot. Runtime startup is not yet verified. Check: systemctl status infraveil-launcher", False
+    except Exception as exc:
+        return False, "Could not auto-register a boot service (" + str(exc)[:160] + "). Automatic startup is not verified; review the existing service or continue manually.", False
+
+def run_onboarding():
+    print("", flush=True)
+    print("  " + c(ANSI_WHITE) + "Welcome to Infraveil." + c(ANSI_RESET), flush=True)
+    print("  " + c(ANSI_GREY) + "A quick one-time setup. Your choices are saved, so every run after this is silent and unattended." + c(ANSI_RESET), flush=True)
+    print("", flush=True)
+    a = {}
+    if os.environ.get("INFRAVEIL_TRUST_CONSOLE_RUNTIME") == "1":
+        a["venv"] = False
+        a["install_deps"] = False
+        log("Using the Trust Console's hash-locked Python runtime.", level="OK")
+    else:
+        a["venv"] = _ask_yes_no("Use the existing verified Python runtime?", True)
+        a["install_deps"] = False
+    if not shutil.which("node"):
+        print("", flush=True)
+        log("Node.js isn't installed - Node-based services will be skipped until it is.", level="WARN")
+        log("Install it with:  " + _node_install_hint(), level="INFO")
+    a["service"] = _ask_yes_no("Start Infraveil automatically on boot, so it keeps running unattended for the long haul?", True)
+    a["service_registered"] = False
+    print("", flush=True)
+    log("Setup saved - this won't ask again. Welcome aboard.", level="OK")
+    return a
+
+def ensure_venv():
+    python_path = _ensure_launcher_dependencies()
+    log("Using the verified dedicated hash-locked management runtime.", level="OK")
+    return python_path
+
+"""Launcher orphan-process cleanup with explicit, late-bound effect ports.
+
+This source is inert and importable for synthetic fixtures. The verified runtime
+assembler also inlines it into the one complete customer launcher; customers do
+not need a neighboring package. It owns the existing bounded scan/stop/recheck
+algorithm, not enrollment, startup, signatures, process spawning or permission.
+"""
+
+
+class LauncherOrphanProcessPorts:
+    """Only the named effects and current identities needed by this domain.
+
+    Identity/path providers and effect callbacks remain late-bound so existing
+    launcher composition, test substitution and exception ordering are retained.
+    Constructing this object performs no I/O or process inspection.
+    """
+
+    def __init__(self, *, data_directory, client_id, launcher_host_id,
+                 current_pid, process_iter, wait_processes, now, sleep,
+                 list_directory, join_path, path_exists, absolute_path,
+                 normalize_case, audit, access_denied, no_such_process):
+        self.data_directory = data_directory
+        self.client_id = client_id
+        self.launcher_host_id = launcher_host_id
+        self.current_pid = current_pid
+        self.process_iter = process_iter
+        self.wait_processes = wait_processes
+        self.now = now
+        self.sleep = sleep
+        self.list_directory = list_directory
+        self.join_path = join_path
+        self.path_exists = path_exists
+        self.absolute_path = absolute_path
+        self.normalize_case = normalize_case
+        self.audit = audit
+        self.access_denied = access_denied
+        self.no_such_process = no_such_process
+
+
+class LauncherOrphanProcesses:
+    """Own the existing environment/path evidence and bounded orphan cleanup.
+
+    No process/state namespace is injected. Process objects cross the explicit
+    process-iterator port; tests supply synthetic objects, never host processes.
+    """
+
+    def __init__(self, ports):
+        self._ports = ports
+
+    def _process_environ_matches(self, proc, expected):
+        try:
+            env = proc.environ()
+        except Exception:
+            return False
+        for key, value in expected.items():
+            if env.get(key) != value:
+                return False
+        return True
+
+    def _runtime_path_marker_matches(self, haystack, marker):
+        if not marker:
+            return False
+        try:
+            hay = self._ports.normalize_case(self._ports.absolute_path(haystack)) if self._ports.path_exists(haystack) else self._ports.normalize_case(str(haystack))
+            needle = self._ports.normalize_case(str(marker))
+            return needle in hay
+        except Exception:
+            return str(marker) in str(haystack)
+
+    def _known_agent_script_paths(self, script_dir):
+        paths = set()
+        try:
+            for name in self._ports.list_directory(script_dir):
+                if name.startswith("agent_") and name.endswith(".py"):
+                    paths.add(self._ports.join_path(script_dir, name))
+        except Exception:
+            pass
+        return paths
+
+    def cleanup_orphaned_runtime_processes(self):
+        script_dir = self._ports.data_directory()
+        workspace_marker = self._ports.join_path(script_dir, "infraveil_payload_workspace_")
+        agent_scripts = self._known_agent_script_paths(script_dir)
+        expected_env = {
+            "INFRAVEIL_CLIENT_ID": self._ports.client_id(),
+            "INFRAVEIL_LAUNCHER_HOST_ID": self._ports.launcher_host_id(),
+        }
+        victims = []
+        scan_complete = True
+
+        def owned_processes():
+            owned = []
+            nonlocal scan_complete
+            current_pid = self._ports.current_pid()
+            deadline = self._ports.now() + 2.5
+            for proc in self._ports.process_iter(['pid', 'name', 'cmdline', 'cwd']):
+                if self._ports.now() >= deadline:
+                    scan_complete = False
+                    break
+                try:
+                    if proc.info["pid"] == current_pid:
+                        continue
+                    cmdline = " ".join(proc.info.get("cmdline") or [])
+                    cwd = proc.info.get("cwd") or ""
+                    haystack = f"{cmdline} {cwd}"
+                    if (
+                        self._process_environ_matches(proc, expected_env)
+                        or any(self._runtime_path_marker_matches(haystack, path) for path in agent_scripts)
+                        or self._runtime_path_marker_matches(haystack, workspace_marker)
+                    ):
+                        owned.append(proc)
+                except self._ports.access_denied:
+                    scan_complete = False
+                except (self._ports.no_such_process, KeyError):
+                    continue
+                except Exception:
+                    scan_complete = False
+            return owned
+
+        try:
+            victims = owned_processes()
+            for proc in victims:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            _, alive = self._ports.wait_processes(victims, timeout=2)
+            for proc in alive:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            if victims:
+                self._ports.sleep(0.5)
+            survivors = owned_processes()
+            if survivors or not scan_complete:
+                self._ports.audit(
+                    "orphan_runtime_cleanup_failed",
+                    surviving_pids=[proc.pid for proc in survivors],
+                    scan_complete=scan_complete,
+                )
+                return False
+            return True
+        except Exception as exc:
+            self._ports.audit("orphan_runtime_cleanup_failed", error=str(exc)[:200])
+            return False
+def _safe_agent_slug(agent_id):
+    raw = str(agent_id or "agent")
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._-") or "agent"
+    digest = hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return f"{cleaned[:48]}_{digest}"
+
+def get_agent_filepath(agent_id):
+    return os.path.join(_DATA_DIR, f"agent_{_safe_agent_slug(agent_id)}.py")
+
+agent_pids = {}
+agent_names = {}
+
+def get_agent_logpath(agent_id):
+    return os.path.join(_DATA_DIR, f"agent_{_safe_agent_slug(agent_id)}.runtime.log")
+
+def _agent_log_tail(agent_id, max_lines=8):
+    try:
+        with open(get_agent_logpath(agent_id), "r", encoding="utf-8", errors="replace") as f:
+            lines = [ln.rstrip() for ln in f if ln.strip()]
+        return lines[-max_lines:]
+    except Exception:
+        return []
+
+def get_agent_bootstrap_logpath(agent_id):
+    return os.path.join(_DATA_DIR, f"agent_bootstrap_{str(agent_id)}.log")
+
+_node_skip_checked = set()
+_node_skipped_agents = set()
+_node_skip_announced = 0
+
+def _surface_node_skips(agent_id, name):
+    if agent_id in _node_skip_checked:
+        return
+    try:
+        with open(get_agent_bootstrap_logpath(agent_id), "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except Exception:
+        return
+    if not text.strip():
+        return
+    _node_skip_checked.add(agent_id)
+    if "Node.js is not installed" in text or "Node.js is not available" in text:
+        _node_skipped_agents.add(agent_id)
+
+def _emit_node_skip_summary():
+    global _node_skip_announced
+    n = len(_node_skipped_agents)
+    if n <= _node_skip_announced:
+        return
+    _node_skip_announced = n
+    log(f"Node.js not installed on this host - {n} stack{'s' if n != 1 else ''} skipped a Node service (their Python services still run). Install to enable them:  " + _node_install_hint(), level="WARN")
+
+_launcher_orphan_ports = LauncherOrphanProcessPorts(
+    data_directory=lambda: _DATA_DIR,
+    client_id=lambda: CLIENT_ID,
+    launcher_host_id=lambda: LAUNCHER_HOST_ID,
+    current_pid=lambda: os.getpid(),
+    process_iter=lambda fields: psutil.process_iter(fields),
+    wait_processes=lambda processes, **options: psutil.wait_procs(processes, **options),
+    now=lambda: time.time(),
+    sleep=lambda seconds: time.sleep(seconds),
+    list_directory=lambda directory: os.listdir(directory),
+    join_path=lambda *parts: os.path.join(*parts),
+    path_exists=lambda path: os.path.exists(path),
+    absolute_path=lambda path: os.path.abspath(path),
+    normalize_case=lambda path: os.path.normcase(path),
+    audit=lambda event, **fields: _append_local_audit(event, **fields),
+    access_denied=psutil.AccessDenied,
+    no_such_process=psutil.NoSuchProcess,
+)
+_launcher_orphan_processes = LauncherOrphanProcesses(_launcher_orphan_ports)
+_process_environ_matches = _launcher_orphan_processes._process_environ_matches
+_runtime_path_marker_matches = _launcher_orphan_processes._runtime_path_marker_matches
+_known_agent_script_paths = _launcher_orphan_processes._known_agent_script_paths
+cleanup_orphaned_runtime_processes = _launcher_orphan_processes.cleanup_orphaned_runtime_processes
+
+
+
+
+def cleanup_agent_artifacts():
+    script_dir = _DATA_DIR
+    try:
+        for f in os.listdir(script_dir):
+            full = os.path.join(script_dir, f)
+            if f.startswith("agent_") and (f.endswith(".py") or f.endswith(".runtime.log")):
+                try:
+                    os.remove(full)
+                except Exception:
+                    pass
+            elif f.startswith("agent_bootstrap_") and f.endswith(".log"):
+                try:
+                    os.remove(full)
+                except Exception:
+                    pass
+            elif f.startswith("infraveil_payload_workspace") and os.path.isdir(full):
+                try:
+                    import shutil
+                    shutil.rmtree(full, ignore_errors=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+def _migrate_legacy_layout():
+    if _DATA_DIR == _SCRIPT_DIR:
+        return
+    moved = 0
+    removed = 0
+    for fn in ("launcher_state.json", "infraveil_onboarding.json", "launcher_audit.jsonl"):
+        src = os.path.join(_SCRIPT_DIR, fn)
+        dst = os.path.join(_DATA_DIR, fn)
+        if os.path.isfile(src) and not os.path.exists(dst):
+            try:
+                shutil.move(src, dst)
+                moved += 1
+            except Exception:
+                pass
+    junk_exact = {"payload_versions", "infraveil_persistent", "launcher.lock",
+                  "launcher_state.json", "infraveil_onboarding.json", "launcher_audit.jsonl"}
+    junk_prefix = ("agent_", "launcher_payload_", "infraveil_payload_workspace_")
+    try:
+        for name in os.listdir(_SCRIPT_DIR):
+            if name not in junk_exact and not name.startswith(junk_prefix):
+                continue
+            full = os.path.join(_SCRIPT_DIR, name)
+            try:
+                if os.path.isdir(full):
+                    shutil.rmtree(full, ignore_errors=True)
+                else:
+                    os.remove(full)
+                removed += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if moved or removed:
+        log(f"Tidied workspace: kept {moved} settings file(s), cleared {removed} legacy runtime file(s) into .infraveil/.", level="OK")
+
+def _windows_kernel32():
+    if os.name != "nt":
+        return None
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32
+
+def _create_windows_kill_job(proc):
+    """Contain an agent tree so stop remains enforceable after its parent exits."""
+    if os.name != "nt":
+        return None
+    from ctypes import wintypes
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = _windows_kernel32()
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not kernel32.AssignProcessToJobObject(job, wintypes.HANDLE(proc._handle)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return job
+    except Exception:
+        kernel32.CloseHandle(job)
+        raise
+
+def _pid_alive(pid):
+    try:
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            return psutil.pid_exists(pid)
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+def acquire_singleton_lock():
+    try:
+        try:
+            fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+            return
+        except FileExistsError:
+            pass
+
+        if os.path.exists(LOCK_PATH):
+            try:
+                with open(LOCK_PATH, "r", encoding="utf-8") as f:
+                    existing_pid = int((f.read() or "0").strip() or "0")
+            except Exception:
+                existing_pid = 0
+            if existing_pid and _pid_alive(existing_pid) and existing_pid != os.getpid():
+                log(f"Another launcher instance is already running (pid {existing_pid}). Exiting.", level="ERR")
+                sys.exit(1)
+            try:
+                os.remove(LOCK_PATH)
+            except Exception:
+                pass
+        fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+    except Exception as exc:
+        log(f"Could not acquire launcher singleton lock: {exc}", level="ERR")
+        sys.exit(1)
+
+def release_singleton_lock():
+    try:
+        if os.path.exists(LOCK_PATH):
+            os.remove(LOCK_PATH)
+    except Exception:
+        pass
+
+def spawn_agent(agent_id, payload, name="unnamed", payload_hash=None, candidate_version="", stage_candidate=True, persist_state=True, runtime_retry_id=""):
+    _require_agent_source_security_epoch(payload)
+    python_cmd, managed_env = _runtime_python_for_source(payload)
+    filepath = get_agent_filepath(agent_id)
+    logpath = get_agent_logpath(agent_id)
+    _atomic_write_text(filepath, payload)
+
+    env = managed_env
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["INFRAVEIL_CLIENT_ID"] = CLIENT_ID
+    env["INFRAVEIL_LAUNCHER_HOST_ID"] = LAUNCHER_HOST_ID
+    env["INFRAVEIL_AGENT_ID"] = str(agent_id)
+    env["INFRAVEIL_RUNTIME_OWNER"] = "launcher"
+    env.pop("INFRAVEIL_RUNTIME_RETRY_ID", None)
+    if runtime_retry_id:
+        env["INFRAVEIL_RUNTIME_RETRY_ID"] = str(runtime_retry_id)
+    log_handle = open(logpath, "a", encoding="utf-8")
+    try:
+        os.chmod(logpath, 0o600)
+    except Exception:
+        pass
+    popen_kwargs = {
+        "cwd": _DATA_DIR,
+        "env": env,
+        "stdout": log_handle,
+        "stderr": subprocess.STDOUT,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen([python_cmd, "-u", filepath], **popen_kwargs)
+    if os.name == "nt":
+        try:
+            agent_job_handles[agent_id] = _create_windows_kill_job(proc)
+            psutil.Process(proc.pid).resume()
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            job_handle = agent_job_handles.pop(agent_id, None)
+            if job_handle:
+                try:
+                    _windows_kernel32().CloseHandle(job_handle)
+                except Exception:
+                    pass
+            try:
+                log_handle.close()
+            except Exception:
+                pass
+            raise
+    proc._infraveil_log_handle = log_handle
+    agents[agent_id] = proc
+    agent_pids[agent_id] = {proc.pid}
+    agent_names[agent_id] = name
+    if stage_candidate:
+        try:
+            _record_spawn(agent_id, payload, payload_hash, candidate_version=candidate_version, persist_state=persist_state)
+        except Exception as exc:
+            _append_local_audit(
+                "agent_candidate_staging_failed",
+                agent_id=agent_id,
+                name=name,
+                error=str(exc)[:200],
+            )
+            stopped = kill_agent(agent_id, name=name, reason="candidate-staging-failed", wait_for_ports=True)
+            if not stopped:
+                raise RuntimeError("candidate cache staging failed and the candidate could not be stopped") from exc
+            raise RuntimeError("candidate cache staging failed; candidate was stopped") from exc
+    else:
+        meta = _runtime_meta(agent_id)
+        meta["last_start_at"] = time.time()
+        if persist_state:
+            _persist_runtime_state()
+    hash_str = f"sha256:{payload_hash[:16]}..." if payload_hash else "sha256:pending"
+    _append_local_audit("agent_started", agent_id=agent_id, name=name, pid=proc.pid, payload_hash=payload_hash or "")
+    if _progress.active:
+        _progress.tick("start")
+    else:
+        log_agent("NODE STARTED", agent_id, name, f"pid:{proc.pid}  {hash_str}", level="OK")
+
+def wait_for_ports_to_release(ports, timeout=2.0):
+    if not ports:
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        still_in_use = False
+        try:
+            for conn in psutil.net_connections(kind='tcp'):
+                if conn.status == 'LISTEN' and conn.laddr and conn.laddr.port in ports:
+                    still_in_use = True
+                    break
+        except Exception:
+            pass
+        if not still_in_use:
+            return
+        time.sleep(0.1)
+
+def kill_agent(agent_id, name="unnamed", reason="", wait_for_ports=False):
+    proc = agents.get(agent_id)
+    ports_used = set()
+    child_processes = []
+
+    if not proc:
+        return True
+
+    if wait_for_ports:
+        try:
+            p = psutil.Process(proc.pid)
+            child_processes = p.children(recursive=True)
+            for conn in p.net_connections(kind='tcp'):
+                if conn.laddr:
+                    ports_used.add(conn.laddr.port)
+            for child in child_processes:
+                try:
+                    for conn in child.net_connections(kind='tcp'):
+                        if conn.laddr:
+                            ports_used.add(conn.laddr.port)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Agents are spawned with start_new_session=True, so their process-group ID
+    # is the original parent PID even after that session leader exits.
+    pgid = proc.pid if os.name != "nt" else None
+    try:
+        if os.name != "nt":
+            try:
+                parent = psutil.Process(proc.pid)
+                child_processes = parent.children(recursive=True)
+                for child in child_processes:
+                    try:
+                        child.terminate()
+                    except Exception:
+                        pass
+            except Exception:
+                child_processes = []
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            try:
+                _, alive = psutil.wait_procs(child_processes, timeout=1)
+                for child in alive:
+                    try:
+                        child.kill()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        else:
+            job_handle = agent_job_handles.get(agent_id)
+            if job_handle:
+                if not _windows_kernel32().TerminateJobObject(job_handle, 1):
+                    raise OSError(ctypes.get_last_error(), "TerminateJobObject failed")
+            elif proc.poll() is not None:
+                raise RuntimeError("cannot verify descendant containment without the agent Job Object")
+            try:
+                parent = psutil.Process(proc.pid)
+                child_processes = parent.children(recursive=True)
+                for child in child_processes:
+                    try:
+                        child.terminate()
+                    except Exception:
+                        pass
+                try:
+                    parent.terminate()
+                except Exception:
+                    pass
+                _, alive = psutil.wait_procs(child_processes + [parent], timeout=2)
+                for p in alive:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception as exc:
+        _append_local_audit("agent_stop_attempt_failed", agent_id=agent_id, name=name, reason=reason or "", error=str(exc)[:200])
+
+    try:
+        proc.wait(timeout=1)
+    except Exception:
+        pass
+
+    parent_alive = proc.poll() is None
+    surviving_children = []
+    for child in child_processes:
+        try:
+            if child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
+                surviving_children.append(child.pid)
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        except Exception:
+            surviving_children.append(getattr(child, "pid", 0))
+    group_alive = False
+    surviving_group_pids = []
+    if os.name != "nt" and pgid is not None:
+        # SIGKILL delivery is asynchronous. An exited session leader cannot be
+        # waited on to establish that its remaining group members have stopped.
+        # Recheck this exact group for a bounded interval instead of turning a
+        # transient post-signal observation into a permanent failed receipt.
+        group_deadline = time.monotonic() + 1.0
+        while True:
+            surviving_group_pids = []
+            for group_proc in psutil.process_iter(["pid", "status"]):
+                try:
+                    if os.getpgid(group_proc.pid) == pgid and group_proc.status() != psutil.STATUS_ZOMBIE:
+                        surviving_group_pids.append(group_proc.pid)
+                except (ProcessLookupError, psutil.NoSuchProcess, psutil.ZombieProcess):
+                    continue
+                except PermissionError:
+                    surviving_group_pids.append(group_proc.pid)
+            if not surviving_group_pids or time.monotonic() >= group_deadline:
+                break
+            time.sleep(0.02)
+        group_alive = bool(surviving_group_pids)
+    owned_survivors = []
+    expected_env = {
+        "INFRAVEIL_CLIENT_ID": CLIENT_ID,
+        "INFRAVEIL_LAUNCHER_HOST_ID": LAUNCHER_HOST_ID,
+        "INFRAVEIL_AGENT_ID": str(agent_id),
+    }
+    for owned_proc in psutil.process_iter(["pid"]):
+        try:
+            if _process_environ_matches(owned_proc, expected_env):
+                owned_survivors.append(owned_proc.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        except Exception:
+            owned_survivors.append(getattr(owned_proc, "pid", 0))
+    if owned_survivors:
+        for owned_pid in owned_survivors:
+            try:
+                psutil.Process(owned_pid).kill()
+            except Exception:
+                pass
+        time.sleep(0.2)
+        live_owned = []
+        for pid in owned_survivors:
+            try:
+                owned = psutil.Process(pid)
+                if owned.is_running() and owned.status() != psutil.STATUS_ZOMBIE and _process_environ_matches(owned, expected_env):
+                    live_owned.append(pid)
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                pass
+            except Exception:
+                live_owned.append(pid)
+        owned_survivors = live_owned
+    if parent_alive or surviving_children or group_alive or owned_survivors:
+        _append_local_audit(
+            "agent_stop_failed",
+            agent_id=agent_id,
+            name=name,
+            reason=reason or "",
+            parent_alive=parent_alive,
+            surviving_children=surviving_children,
+            process_group_alive=group_alive,
+            surviving_group_pids=surviving_group_pids,
+            surviving_owned_pids=owned_survivors,
+        )
+        log_agent("STOP FAILED", agent_id, name, "process still alive; keeping runtime tracked", level="ERR")
+        return False
+
+    try:
+        proc._infraveil_log_handle.close()
+    except Exception:
+        pass
+
+    agents.pop(agent_id, None)
+    agent_pids.pop(agent_id, None)
+    agent_names.pop(agent_id, None)
+    job_handle = agent_job_handles.pop(agent_id, None)
+    if job_handle and os.name == "nt":
+        try:
+            _windows_kernel32().CloseHandle(job_handle)
+        except Exception:
+            pass
+
+    filepath = get_agent_filepath(agent_id)
+    if os.path.exists(filepath):
+        try:
+            os.remove(filepath)
+        except Exception:
+            pass
+
+    suffix = f"  reason:{reason}" if reason else ""
+    _append_local_audit("agent_stopped", agent_id=agent_id, name=name, reason=reason or "", ports=list(ports_used))
+    if not _progress.active:
+        log_agent("NODE STOPPED", agent_id, name, suffix, level="WARN")
+
+    if wait_for_ports and ports_used:
+        wait_for_ports_to_release(ports_used)
+    return True
+
+def kill_agents_concurrently(items):
+    """Stop a fleet in parallel so the graceful timeout is paid once per batch."""
+    if not items:
+        return 0
+    if len(items) == 1:
+        agent_id, name, reason = items[0]
+        return 1 if kill_agent(agent_id, name=name, reason=reason) else 0
+
+    import concurrent.futures as _cf
+
+    def _stop(item):
+        agent_id, name, reason = item
+        try:
+            return bool(kill_agent(agent_id, name=name, reason=reason))
+        except Exception as exc:
+            log(f"Failed to stop agent {agent_id}: {exc}", level="ERR")
+            return False
+
+    with _cf.ThreadPoolExecutor(max_workers=min(128, len(items))) as executor:
+        return sum(1 for stopped in executor.map(_stop, items) if stopped)
+
+def fetch_agent(agent_id, name="unnamed"):
+    failed_at = float(_runtime_meta(agent_id).get("last_fetch_failure_at", 0) or 0)
+    if failed_at and time.time() - failed_at < AGENT_FETCH_RETRY_DELAY_SECONDS:
+        return None
+    if not _progress.active:
+        log_agent("FETCHING", agent_id, name, "requesting encrypted payload...", level="INFO")
+    try:
+        r = _request_with_retries("/launcher/agent/fetch", {"client_id": CLIENT_ID, "agent_id": agent_id, "launcher_host_id": LAUNCHER_HOST_ID}, timeout=30, attempts=3)
+        if r.status_code == 200:
+            _progress.tick("fetch")
+            agent_hash = hashlib.sha256(r.content or b"").hexdigest()
+            if RELEASE_PUBLIC_KEY:
+                sig = str(r.headers.get("X-Infraveil-Agent-Ed25519") or "").strip()
+                try:
+                    Ed25519PublicKey.from_public_bytes(bytes.fromhex(RELEASE_PUBLIC_KEY)).verify(bytes.fromhex(sig), agent_hash.encode("utf-8"))
+                except Exception:
+                    _runtime_meta(agent_id)["last_fetch_failure_at"] = time.time()
+                    _persist_runtime_state()
+                    _append_local_audit("agent_release_signature_rejected", agent_id=agent_id, name=name)
+                    log_agent("REJECTED", agent_id, name, "agent release signature invalid — refusing to run", level="ERR")
+                    return None
+            if CUSTOMER_APPROVAL_KEY:
+                approval = str(r.headers.get("X-Infraveil-Agent-Customer-Approval") or "").strip().lower()
+                try:
+                    Ed25519PublicKey.from_public_bytes(bytes.fromhex(CUSTOMER_APPROVAL_KEY)).verify(bytes.fromhex(approval), agent_hash.encode("utf-8"))
+                except Exception:
+                    _runtime_meta(agent_id)["last_fetch_failure_at"] = time.time()
+                    _persist_runtime_state()
+                    _append_local_audit("agent_customer_approval_rejected", agent_id=agent_id, name=name)
+                    log_agent("REJECTED", agent_id, name, "customer release approval invalid - refusing to run", level="ERR")
+                    return None
+            _runtime_meta(agent_id)["last_fetch_failure_at"] = 0.0
+            _persist_runtime_state()
+            if _progress.active:
+                _progress.tick("decrypt")
+            else:
+                log_agent("DECRYPTED", agent_id, name, "payload received OK", level="OK")
+            _append_local_audit("agent_payload_fetched", agent_id=agent_id, name=name, status=200)
+            return r.content.decode("utf-8")
+        else:
+            _runtime_meta(agent_id)["last_fetch_failure_at"] = time.time()
+            _persist_runtime_state()
+            log_agent("FETCH FAILED", agent_id, name, f"http:{r.status_code}", level="ERR")
+            _append_local_audit("agent_payload_fetch_failed", agent_id=agent_id, name=name, status=r.status_code)
+    except Exception as e:
+        _runtime_meta(agent_id)["last_fetch_failure_at"] = time.time()
+        _persist_runtime_state()
+        log_agent("FETCH ERROR", agent_id, name, str(e)[:60], level="ERR")
+    return None
+
+def _self_update(new_version):
+    try:
+        r = _request_with_retries("/launcher/self-source", {"client_id": CLIENT_ID, "launcher_host_id": LAUNCHER_HOST_ID}, timeout=30, attempts=2)
+        if r.status_code != 200:
+            log(f"AUTO-UPDATE: launcher v{new_version} not served (http:{r.status_code}); staying on v{LAUNCHER_VERSION}", level="WARN")
+            return False
+        new_src = r.content or b""
+        src_hash = hashlib.sha256(new_src).hexdigest()
+        if RELEASE_PUBLIC_KEY:
+            sig = str(r.headers.get("X-Infraveil-Launcher-Ed25519") or "").strip()
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(RELEASE_PUBLIC_KEY)).verify(bytes.fromhex(sig), src_hash.encode("utf-8"))
+        if CUSTOMER_APPROVAL_KEY:
+            approval = str(r.headers.get("X-Infraveil-Launcher-Customer-Approval") or "").strip().lower()
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(CUSTOMER_APPROVAL_KEY)).verify(bytes.fromhex(approval), src_hash.encode("utf-8"))
+        text = new_src.decode("utf-8")
+        target = os.path.abspath(__file__)
+        compile(text, target, "exec")
+        _validate_launcher_source_context(text, new_version)
+        replacement_python, replacement_env = _runtime_python_for_source(text)
+        tmp = target + ".update"
+        _atomic_write_bytes(tmp, new_src)
+        with open(target, "rb") as previous:
+            _atomic_write_bytes(LAUNCHER_PREVIOUS_PATH, previous.read())
+        _atomic_write_text(LAUNCHER_UPDATE_MARKER, json.dumps({"from_version": LAUNCHER_VERSION, "to_version": new_version, "boot_attempts": 0, "created_at": time.time()}, separators=(",", ":"), sort_keys=True))
+        if not shutdown_all_agents(reason="launcher-self-update"):
+            try:
+                if os.path.exists(LAUNCHER_UPDATE_MARKER):
+                    os.remove(LAUNCHER_UPDATE_MARKER)
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception as cleanup_exc:
+                log(f"AUTO-UPDATE: could not clear deferred update staging: {cleanup_exc}", level="ERR")
+            _append_local_audit(
+                "launcher_self_update_deferred",
+                from_version=LAUNCHER_VERSION,
+                to_version=new_version,
+                source_hash=src_hash,
+                current_source_unchanged=True,
+            )
+            log("AUTO-UPDATE: running agents could not be stopped; current launcher source remains active", level="ERR")
+            return False
+        if not cleanup_orphaned_runtime_processes():
+            raise RuntimeError("owned orphan processes could not be contained before self-update")
+        os.replace(tmp, target)
+        log(f"AUTO-UPDATE: launcher v{LAUNCHER_VERSION} -> v{new_version} verified; restarting daemon...", level="OK")
+        _append_local_audit("launcher_self_update", from_version=LAUNCHER_VERSION, to_version=new_version, source_hash=src_hash)
+        _persist_runtime_state()
+        if os.environ.get("INFRAVEIL_NONINTERACTIVE") == "1":
+            replacement_env["INFRAVEIL_START_GUARD_ADMITTED"] = "1"
+        os.execve(replacement_python, [replacement_python, "-I", target] + sys.argv[1:], replacement_env)
+    except Exception as e:
+        log(f"AUTO-UPDATE: launcher self-update to v{new_version} failed; staying on v{LAUNCHER_VERSION}: {str(e)[:80]}", level="WARN")
+        return False
+
+def _fetch_payload_raw(agent_id, name="unnamed"):
+    if not _progress.active:
+        log_agent("FETCHING", agent_id, name, "requesting encrypted payload...", level="INFO")
+    r = _request_with_retries("/launcher/agent/fetch", {"client_id": CLIENT_ID, "agent_id": agent_id, "launcher_host_id": LAUNCHER_HOST_ID}, timeout=30, attempts=3)
+    if r.status_code != 200:
+        raise RuntimeError("http:%s" % r.status_code)
+    _progress.tick("fetch")
+    agent_hash = hashlib.sha256(r.content or b"").hexdigest()
+    if RELEASE_PUBLIC_KEY:
+        sig = str(r.headers.get("X-Infraveil-Agent-Ed25519") or "").strip()
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(RELEASE_PUBLIC_KEY)).verify(bytes.fromhex(sig), agent_hash.encode("utf-8"))
+    if CUSTOMER_APPROVAL_KEY:
+        approval = str(r.headers.get("X-Infraveil-Agent-Customer-Approval") or "").strip().lower()
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(CUSTOMER_APPROVAL_KEY)).verify(bytes.fromhex(approval), agent_hash.encode("utf-8"))
+    if _progress.active:
+        _progress.tick("decrypt")
+    else:
+        log_agent("DECRYPTED", agent_id, name, "payload received OK", level="OK")
+    return r.content.decode("utf-8")
+
+_prefetch_cache = {}
+
+def _prefetch_payloads(items):
+    if len(items) < 2:
+        return
+    import concurrent.futures as _cf
+    def _one(it):
+        aid, nm = it
+        try:
+            _prefetch_cache[aid] = _fetch_payload_raw(aid, nm)
+        except Exception as exc:
+            _prefetch_cache[aid] = None
+            _runtime_meta(aid)["last_fetch_failure_at"] = time.time()
+            log_agent("FETCH FAILED", aid, nm, str(exc)[:100], level="ERR")
+            _append_local_audit("agent_payload_fetch_failed", agent_id=aid, name=nm, error=str(exc)[:200])
+    with _cf.ThreadPoolExecutor(max_workers=min(12, len(items))) as ex:
+        list(ex.map(_one, items))
+
+def _consume_prefetched(agent_id, name):
+    payload = _prefetch_cache.pop(agent_id, None)
+    if payload is None:
+        _persist_runtime_state()
+        return None
+    _runtime_meta(agent_id)["last_fetch_failure_at"] = 0.0
+    _append_local_audit("agent_payload_fetched", agent_id=agent_id, name=name, status=200)
+    return payload
+
+
+def _agent_payload_for_start(agent_id, name):
+    # A failed parallel fetch is still a completed attempt. Do not immediately
+    # repeat it serially, bypassing the fetch backoff and approval gate.
+    if agent_id in _prefetch_cache:
+        return _consume_prefetched(agent_id, name)
+    return fetch_agent(agent_id, name=name)
+
+def _launcher_status_payload():
+    _promote_healthy_candidates()
+    now = time.time()
+    running = {}
+    for agent_id, proc in list(agents.items()):
+        meta = _runtime_meta(agent_id)
+        running[agent_id] = {
+            "pid": getattr(proc, "pid", 0),
+            "alive": proc.poll() is None,
+            "name": agent_names.get(agent_id, agent_id),
+            "last_start_at": meta.get("last_start_at", 0.0),
+            "last_payload_hash": meta.get("last_payload_hash", ""),
+            "crash_count_window": len([ts for ts in meta.get("crash_times", []) if now - ts < AGENT_RESPAWN_WINDOW_SECONDS]),
+            "suspended_until": meta.get("suspended_until", 0.0),
+            "suspension_reason": meta.get("suspension_reason", ""),
+            "last_fetch_failure_at": meta.get("last_fetch_failure_at", 0.0),
+            "update_state": {
+                "active_version": meta.get("active_runtime_version", ""),
+                "candidate_version": meta.get("candidate_version", ""),
+                "candidate_started_at": meta.get("candidate_started_at", 0.0),
+                "blocked_version": meta.get("blocked_runtime_version", ""),
+                "last_rollback_at": meta.get("last_rollback_at", 0.0),
+                "rollback_count": meta.get("rollback_count", 0),
+                "health_gate_seconds": AGENT_CANDIDATE_HEALTH_SECONDS,
+            },
+        }
+    try:
+        cpu = psutil.cpu_percent(interval=None)
+        memory = psutil.virtual_memory().percent
+        disk = psutil.disk_usage(os.path.dirname(os.path.realpath(__file__))).percent
+    except Exception:
+        cpu = memory = disk = 0
+    return {
+        "launcher_version": LAUNCHER_VERSION,
+        **RUNTIME_DEPENDENCY_STATUS,
+        "launcher_capabilities": LAUNCHER_CAPABILITIES,
+        "launcher_source_hash": _launcher_source_hash(),
+        "host_fingerprint": _host_fingerprint(),
+        "hostname": socket.gethostname(),
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "python": platform.python_version(),
+        },
+        "pid": os.getpid(),
+        "online": control_plane_online,
+        "sync_failure_count": sync_failure_count,
+        "agent_count": len(agents),
+        "running_agents": running,
+        "cached_agents": list(agent_runtime_meta.keys()),
+        "capacity_diagnostic": last_capacity_diagnostic,
+        "cpu": cpu,
+        "memory": memory,
+        "disk": disk,
+        "updated_at": time.time(),
+        "local_audit_tail": _read_local_audit_tail(),
+    }
+
+def run_doctor():
+    checks = {
+        "version": LAUNCHER_VERSION,
+        "source_hash_present": bool(_launcher_source_hash()),
+        "host_fingerprint_present": bool(_host_fingerprint()),
+        "lock_present": os.path.exists(LOCK_PATH),
+        "state_writable": os.access(os.path.dirname(STATE_PATH), os.W_OK),
+        "python": platform.python_version(),
+        "agents_tracked": len(agents),
+        "cached_agents": len(agent_runtime_meta),
+        "control_plane_online": control_plane_online,
+        "sync_failure_count": sync_failure_count,
+    }
+    _append_local_audit("launcher_doctor", **checks)
+    log(f"Doctor complete: {json.dumps(checks, separators=(',', ':'), sort_keys=True)}", level="OK")
+
+def _bytes_mb(value):
+    try:
+        return round(float(value or 0) / (1024 * 1024), 1)
+    except Exception:
+        return 0.0
+
+def _agent_process_rss_mb(proc):
+    total = 0
+    try:
+        root = psutil.Process(proc.pid)
+        procs = [root] + root.children(recursive=True)
+        for item in procs:
+            try:
+                total += item.memory_info().rss
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return _bytes_mb(total)
+
+def _capacity_resource_budget():
+    """Respect the process's CPU affinity and effective Linux cgroup ceilings."""
+    vm = psutil.virtual_memory()
+    host_cores = psutil.cpu_count(logical=True) or 1
+    cores = float(host_cores)
+    try:
+        cores = min(cores, float(len(os.sched_getaffinity(0))))
+    except (AttributeError, OSError):
+        try:
+            cores = min(cores, float(len(psutil.Process().cpu_affinity())))
+        except Exception:
+            pass
+    result = {"cpu_cores": max(.01, cores), "host_cpu_cores": host_cores,
+              "memory_total": int(vm.total), "memory_available": int(vm.available),
+              "memory_percent": float(vm.percent), "limited": False, "cpu_usage_seconds": None}
+    if sys.platform != "linux":
+        return result
+
+    def read(path):
+        try:
+            with open(path, encoding="ascii") as stream:
+                return stream.read(4096).strip()
+        except (OSError, UnicodeError):
+            return ""
+
+    roots = {"/sys/fs/cgroup"}
+    for line in read("/proc/self/cgroup").splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        relative = parts[2].lstrip("/")
+        if ".." in relative.split("/"):
+            continue
+        controllers = parts[1].split(",") if parts[1] else [""]
+        for controller in set(controllers + [parts[1]]):
+            if controller not in {"", "cpu", "cpuacct", "cpu,cpuacct", "cpuset", "memory"}:
+                continue
+            base = "/sys/fs/cgroup" + ("/" + controller if controller else "")
+            current = os.path.normpath(os.path.join(base, relative))
+            while current == base or current.startswith(base + "/"):
+                roots.add(current)
+                if current == base:
+                    break
+                current = os.path.dirname(current)
+    cpu_scope = None
+    for root in sorted(roots):
+        quota = read(root + "/cpu.max").split()
+        try:
+            allowed = float(quota[0]) / float(quota[1]) if len(quota) == 2 and quota[0] != "max" else None
+            if allowed is None:
+                q, period = read(root + "/cpu.cfs_quota_us"), read(root + "/cpu.cfs_period_us")
+                allowed = float(q) / float(period) if q and period and float(q) > 0 else None
+            if allowed is not None and allowed > 0 and allowed <= result["cpu_cores"]:
+                result["cpu_cores"] = allowed
+                result["limited"] = True
+                cpu_scope = root
+        except (ValueError, ZeroDivisionError):
+            pass
+        limit = read(root + "/memory.max") or read(root + "/memory.limit_in_bytes")
+        try:
+            if limit and limit != "max" and 0 < int(limit) < int(vm.total):
+                ceiling = int(limit)
+                result["memory_total"] = min(result["memory_total"], ceiling)
+                result["limited"] = True
+                usage = read(root + "/memory.current") or read(root + "/memory.usage_in_bytes")
+                try:
+                    used = max(0, int(usage))
+                    result["memory_available"] = min(result["memory_available"], max(0, ceiling - used))
+                    result["memory_percent"] = max(result["memory_percent"], min(100.0, used * 100 / ceiling))
+                except ValueError:
+                    result["memory_available"] = 0
+        except ValueError:
+            pass
+    if cpu_scope:
+        stat = dict(line.split(None, 1) for line in read(cpu_scope + "/cpu.stat").splitlines() if len(line.split()) == 2)
+        try:
+            result["cpu_usage_seconds"] = float(stat["usage_usec"]) / 1e6 if "usage_usec" in stat else float(read(cpu_scope + "/cpuacct.usage")) / 1e9
+        except ValueError:
+            pass
+    return result
+
+
+def run_capacity_diagnostic():
+    global last_capacity_diagnostic
+    samples = []
+    start = time.time()
+    previous_budget = _capacity_resource_budget()
+    previous_time = time.monotonic()
+    for _ in range(10):
+        try:
+            host_cpu = psutil.cpu_percent(interval=0.2)
+            budget = _capacity_resource_budget()
+            sampled_at = time.monotonic()
+            usage, previous_usage = budget["cpu_usage_seconds"], previous_budget["cpu_usage_seconds"]
+            cpu = host_cpu if usage is None or previous_usage is None else max(0, min(100, (usage - previous_usage) * 100 / max(.001, sampled_at - previous_time) / budget["cpu_cores"]))
+            previous_budget, previous_time = budget, sampled_at
+            du = psutil.disk_usage(os.path.dirname(os.path.realpath(__file__)))
+            samples.append({
+                "cpu": cpu,
+                "memory": budget["memory_percent"],
+                "memory_available_mb": _bytes_mb(budget["memory_available"]),
+                "disk": du.percent,
+                "disk_free_mb": _bytes_mb(du.free),
+            })
+        except Exception:
+            time.sleep(0.2)
+    cpu_values = [float(item.get("cpu", 0) or 0) for item in samples] or [0.0]
+    mem_values = [float(item.get("memory", 0) or 0) for item in samples] or [0.0]
+    disk_values = [float(item.get("disk", 0) or 0) for item in samples] or [0.0]
+    budget = _capacity_resource_budget()
+    du = psutil.disk_usage(os.path.dirname(os.path.realpath(__file__)))
+    per_agent = []
+    for agent_id, proc in list(agents.items()):
+        if proc and proc.poll() is None:
+            per_agent.append(_agent_process_rss_mb(proc))
+    observed_agent_mb = round(sum(per_agent) / len(per_agent), 1) if per_agent else 0.0
+    planning_agent_mb = max(180.0, observed_agent_mb or 180.0)
+    logical_cpu = budget["cpu_cores"]
+    physical_cpu = min(float(psutil.cpu_count(logical=False) or logical_cpu), logical_cpu)
+    avg_cpu = round(sum(cpu_values) / len(cpu_values), 1)
+    peak_cpu = round(max(cpu_values), 1)
+    avg_mem = round(sum(mem_values) / len(mem_values), 1)
+    peak_mem = round(max(mem_values), 1)
+    avg_disk = round(sum(disk_values) / len(disk_values), 1)
+    available_mem_mb = _bytes_mb(budget["memory_available"])
+    free_disk_mb = _bytes_mb(du.free)
+    cpu_room = max(0.0, 72.0 - avg_cpu)
+    cpu_capacity = max(0, int((cpu_room / 8.0) * logical_cpu / 2))
+    memory_capacity = max(0, int((available_mem_mb * 0.70) / planning_agent_mb)) if planning_agent_mb else 0
+    disk_capacity = max(0, int((free_disk_mb * 0.70) / 250.0)) if free_disk_mb else 0
+    current_agents = len([p for p in agents.values() if p and p.poll() is None])
+    additional = min(cpu_capacity, memory_capacity, disk_capacity, 250)
+    safe_capacity = current_agents + additional
+    burst_capacity = current_agents + min(cpu_capacity * 2, memory_capacity, disk_capacity, 500)
+    limiting = min(
+        [("cpu", cpu_capacity), ("memory", memory_capacity), ("disk", disk_capacity)],
+        key=lambda item: item[1],
+    )[0]
+    if avg_cpu >= 80 or avg_mem >= 85 or avg_disk >= 90:
+        rating = "constrained"
+    elif safe_capacity <= max(2, len(agents)):
+        rating = "tight"
+    elif safe_capacity >= 20:
+        rating = "strong"
+    else:
+        rating = "healthy"
+    last_capacity_diagnostic = {
+        "generated_at": time.time(),
+        "duration_seconds": round(time.time() - start, 2),
+        "estimate_only": True,
+        "confidence": "low",
+        "sample_count": len(samples),
+        "resource_scope": "process/cgroup limits" if budget["limited"] else "host and process affinity",
+        "additional_workload_estimate": additional,
+        "rating": rating,
+        "safe_agent_capacity": safe_capacity,
+        "burst_agent_capacity": burst_capacity,
+        "current_agents": len([p for p in agents.values() if p and p.poll() is None]),
+        "limiting_resource": limiting,
+        "cpu": {
+            "logical_cores": logical_cpu,
+            "physical_cores": physical_cpu,
+            "average_percent": avg_cpu,
+            "peak_percent": peak_cpu,
+            "estimated_capacity": cpu_capacity,
+        },
+        "memory": {
+            "total_mb": _bytes_mb(budget["memory_total"]),
+            "available_mb": available_mem_mb,
+            "average_percent": avg_mem,
+            "peak_percent": peak_mem,
+            "observed_per_agent_mb": observed_agent_mb,
+            "planning_per_agent_mb": planning_agent_mb,
+            "estimated_capacity": memory_capacity,
+        },
+        "disk": {
+            "total_mb": _bytes_mb(du.total),
+            "free_mb": free_disk_mb,
+            "average_percent": avg_disk,
+            "estimated_capacity": disk_capacity,
+        },
+        "recommendations": [
+            "Planning estimate only; this short diagnostic is not a throughput or load test.",
+            "Slots count enrolled workloads, not every API process or requests per second.",
+            "Validate with representative workloads before changing placement limits.",
+        ],
+    }
+    _append_local_audit("capacity_diagnostic", **last_capacity_diagnostic)
+    log(f"Capacity diagnostic complete: {json.dumps(last_capacity_diagnostic, separators=(',', ':'), sort_keys=True)}", level="OK")
+
+def _natural_name_key(name):
+    name = str(name or "").lower()
+    starter = 0 if name.startswith("starter") else 1
+    padded = re.sub(r"\d+", lambda m: m.group().zfill(12), name)
+    return (starter, padded)
+
+def _ordered_agent_items(server_agents):
+    def sort_key(item):
+        agent_id, meta = item
+        try:
+            order = int(meta.get("rollout_order", 9999) or 9999)
+        except Exception:
+            order = 9999
+        return (order, _natural_name_key(meta.get("name", "")), agent_id)
+    return sorted((server_agents or {}).items(), key=sort_key)
+
+def _apply_rollout_delay(meta, agent_id, name):
+    try:
+        delay = max(0, int(meta.get("rollout_delay_seconds", 0) or 0))
+    except Exception:
+        delay = 0
+    if delay:
+        log_agent("WAIT", agent_id, name, f"rollout delay {delay}s", level="INFO")
+        slept = 0.0
+        while slept < delay and not shutdown_flag:
+            step = min(0.5, delay - slept)
+            time.sleep(step)
+            slept += step
+
+def poll_control_revision():
+    """Cheap command cursor check; a change is reconciled by the full signed sync."""
+    global last_control_revision, last_control_epoch, control_poll_interval, control_poll_failures
+    payload = {
+        "client_id": CLIENT_ID,
+        "launcher_host_id": LAUNCHER_HOST_ID,
+        "since": last_control_revision,
+        "epoch": last_control_epoch,
+    }
+    try:
+        response = _signed_post_json("/launcher/control", payload, timeout=4)
+        if response.status_code != 200:
+            return False
+        data = response.json()
+        if not isinstance(data, dict):
+            return False
+        revision = max(0, int(data.get("revision", 0) or 0))
+        epoch = str(data.get("epoch") or "")
+        control_poll_interval = max(0.5, min(5.0, float(data.get("poll_after_ms", 500) or 500) / 1000.0))
+        control_poll_failures = 0
+        changed = bool(data.get("changed"))
+        if not changed:
+            last_control_revision = revision
+            last_control_epoch = epoch
+        return changed
+    except Exception:
+        control_poll_failures = min(4, control_poll_failures + 1)
+        control_poll_interval = min(5.0, CONTROL_POLL_INTERVAL * (2 ** control_poll_failures))
+        return False
+
+def sync():
+    global shutdown_flag, control_plane_online, sync_failure_count
+    global last_control_revision, last_control_epoch, control_poll_interval, control_poll_failures
+    global last_stopped_notice_signature
+    global _pending_cache_purge_ack, _pending_agent_cache_purge_acks
+    global _completed_cache_purge_request_id, _completed_agent_cache_purge_request_ids
+    global _pending_command_results
+    global _command_delivery_protocol
+    sent_cache_ack = dict(_pending_cache_purge_ack)
+    sent_agent_acks = {
+        agent_id: dict(ack)
+        for agent_id, ack in _pending_agent_cache_purge_acks.items()
+    }
+    sent_command_results = [
+        dict(result)
+        for result in list(_pending_command_results.values())[:COMMAND_RESULT_BATCH_LIMIT]
+    ]
+    sync_payload = {
+        "client_id": CLIENT_ID,
+        "launcher_host_id": LAUNCHER_HOST_ID,
+        "command_protocol_version": 2,
+        "launcher_status": _launcher_status_payload(),
+    }
+    if sent_cache_ack:
+        sync_payload["cache_purge_ack"] = sent_cache_ack
+    if sent_agent_acks:
+        sync_payload["agent_cache_purge_acks"] = sent_agent_acks
+    if sent_command_results:
+        sync_payload["command_results"] = sent_command_results
+    try:
+        if (sent_cache_ack or sent_agent_acks or sent_command_results) and not _persist_runtime_state():
+            raise RuntimeError("Could not persist pending control-plane acknowledgement")
+        r = _request_with_retries("/launcher/sync", sync_payload, timeout=15, attempts=2)
+        if r.status_code == 403:
+            try:
+                rejection = r.json()
+            except (TypeError, ValueError):
+                rejection = None
+            # Transport verifies the response signature, nonce, path and status
+            # before returning it. A generic auth or lookup failure is not a
+            # revocation; retain local workloads unless revocation is explicit.
+            if isinstance(rejection, dict) and rejection.get("error") == "Machine credential revoked":
+                perform_launcher_shutdown(reason="workspace-revoked", message="Launcher credential explicitly revoked by control plane. Stopping all agents and shutting down...")
+                return
+        if r.status_code != 200:
+            raise RuntimeError(f"Sync rejected with status {r.status_code}")
+        data = r.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("Sync response is not a JSON object")
+        try:
+            _command_delivery_protocol = int(data.get("command_protocol_version", 1) or 1)
+        except (TypeError, ValueError):
+            _command_delivery_protocol = 1
+    except Exception as exc:
+        sync_failure_count += 1
+        if control_plane_online:
+            log(f"Control plane unreachable: {exc}. Keeping local agents running.", level="WARN")
+        control_plane_online = False
+        return False
+
+    _clear_delivered_cache_purge_acks(sent_cache_ack, sent_agent_acks)
+    accepted_command_result_ids = data.get("accepted_command_result_ids")
+    if not isinstance(accepted_command_result_ids, list):
+        accepted_command_result_ids = []
+    _clear_delivered_command_results(sent_command_results, accepted_command_result_ids)
+    if not control_plane_online:
+        log("Control plane connectivity restored.", level="OK")
+    control_plane_online = True
+    sync_failure_count = 0
+    try:
+        last_control_revision = max(0, int(data.get("control_revision", last_control_revision) or 0))
+    except (TypeError, ValueError):
+        pass
+    last_control_epoch = str(data.get("control_epoch") or last_control_epoch)
+    control_poll_interval = CONTROL_POLL_INTERVAL
+    control_poll_failures = 0
+    _confirm_launcher_update()
+
+    l_cmd = data.get("launcher_command", "maintain")
+    launcher_receipt = data.get("launcher_command_receipt")
+    if l_cmd == "maintain" and _command_receipt_id(launcher_receipt):
+        if _begin_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd):
+            _queue_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd, "succeeded")
+    _pub = str(data.get("published_runtime_version") or "").strip()
+    if data.get("launcher_update_available") and _pub and _pub != LAUNCHER_VERSION:
+        _self_update(_pub)
+    if data.get("cache_purge_requested"):
+        purge_request_id = data.get("cache_purge_request_id")
+        if not isinstance(purge_request_id, str) or not purge_request_id.strip():
+            log("Ignored runtime cache purge request without a valid request id.", level="ERR")
+            _append_local_audit("launcher_runtime_cache_purge_rejected", reason="missing-request-id")
+            return True
+        purge_request_id = purge_request_id.strip()
+        if purge_request_id == _completed_cache_purge_request_id:
+            _append_local_audit("launcher_runtime_cache_purge_stale", request_id=purge_request_id)
+            return True
+        log("Received runtime cache purge request. Clearing local cache and runtime artifacts...", level="WARN")
+        if _purge_launcher_runtime_cache():
+            _pending_cache_purge_ack = {"request_id": purge_request_id, "status": "succeeded"}
+            _completed_cache_purge_request_id = purge_request_id
+            _persist_runtime_state()
+            log("Runtime cache purge completed; acknowledgement queued.", level="OK")
+        else:
+            log("Runtime cache purge failed; no acknowledgement will be sent.", level="ERR")
+        return True
+    if l_cmd == "stop":
+        if not _begin_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd):
+            return True
+        perform_launcher_shutdown(
+            reason="signal-shutdown",
+            message="Received shutdown request from workspace. Shutting down daemon...",
+            command_receipt=launcher_receipt,
+            command=l_cmd,
+        )
+        return False
+    elif l_cmd == "doctor":
+        if not _begin_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd):
+            return True
+        try:
+            run_doctor()
+            _queue_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd, "succeeded")
+        except Exception as exc:
+            _queue_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd, "failed", str(exc))
+        return True
+    elif l_cmd == "capacity-diagnostic":
+        if not _begin_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd):
+            return True
+        try:
+            run_capacity_diagnostic()
+            _queue_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd, "succeeded")
+        except Exception as exc:
+            _queue_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd, "failed", str(exc))
+        return True
+    elif l_cmd == "restart":
+        if not _begin_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd):
+            return True
+        log("Received workspace restart request. Rebooting daemon...", level="WARN")
+        if not shutdown_all_agents(reason="launcher-restart"):
+            _queue_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd, "failed", "One or more agents could not be stopped")
+            return True
+        if not cleanup_orphaned_runtime_processes():
+            _queue_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd, "failed", "Runtime process containment could not be verified")
+            return True
+        cleanup_agent_artifacts()
+        try:
+            os.execl(sys.executable, sys.executable, *sys.argv)
+        except Exception as exc:
+            _queue_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd, "failed", str(exc))
+            return True
+    elif l_cmd == "clear-workspace":
+        if not _begin_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd):
+            return True
+        log("Received workspace reset request. Clearing local runtime state...", level="WARN")
+        if not shutdown_all_agents(reason="workspace-clear"):
+            _queue_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd, "failed", "One or more agents could not be stopped")
+            return True
+        if not cleanup_orphaned_runtime_processes():
+            _queue_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd, "failed", "Runtime process containment could not be verified")
+            return True
+        cleanup_agent_artifacts()
+        _queue_command_result(launcher_receipt, "launcher", LAUNCHER_HOST_ID, l_cmd, "succeeded")
+        return True
+
+    server_agents = data.get("agents", {})
+    changed = False
+
+    ordered = _ordered_agent_items(server_agents)
+    _prefetch_cache.clear()
+    _need_fetch = []
+    _stop_targets = []
+    _skipped_stopped = 0
+    _desired_stopped = []
+    for _aid, _meta in ordered:
+        if not _meta.get("has_payload", False):
+            continue
+        if _meta.get("locked") or _meta.get("desired_stopped") or _meta.get("command") == "stop":
+            _desired_stopped.append(_aid)
+            if _meta.get("command") == "stop" and _command_result_seen(_meta.get("current_command_receipt")):
+                _skipped_stopped += 1
+                continue
+            if agents.get(_aid) is None:
+                _skipped_stopped += 1
+            else:
+                _reason = "locked" if _meta.get("locked") else "stop-cmd"
+                _stop_targets.append((_aid, _meta.get("name", "unnamed"), _reason))
+            continue
+        _p = agents.get(_aid)
+        _cmd = _meta.get("command", "maintain")
+        _receipt = _meta.get("current_command_receipt")
+        if _cmd in ("restart", "update") and (
+            _command_result_seen(_receipt)
+            or (_command_requires_receipt(_cmd) and not _command_receipt_id(_receipt))
+        ):
+            continue
+        _runtime = _runtime_meta(_aid)
+        if not _can_attempt_start(_aid)[0] and (_p is None or _p.poll() is not None):
+            continue
+        _failed_at = float(_runtime.get("last_fetch_failure_at", 0) or 0)
+        if _failed_at and time.time() - _failed_at < AGENT_FETCH_RETRY_DELAY_SECONDS:
+            continue
+        if _meta.get("command") in ("restart", "update") or _p is None or _p.poll() is not None:
+            _need_fetch.append((_aid, _meta.get("name", "unnamed")))
+    _stopped_signature = tuple(sorted(_desired_stopped))
+    if _skipped_stopped and not _stop_targets and _stopped_signature != last_stopped_notice_signature:
+        log(f"{_skipped_stopped} workload{'s' if _skipped_stopped != 1 else ''} stopped (start {'them' if _skipped_stopped != 1 else 'it'} from the dashboard to deploy)", level="WARN")
+    last_stopped_notice_signature = _stopped_signature
+    if kill_agents_concurrently(_stop_targets):
+        changed = True
+    if len(_need_fetch) >= 4:
+        _progress.begin(len(_need_fetch))
+    _prefetch_payloads(_need_fetch)
+
+    for agent_id, meta in ordered:
+        cmd = meta.get("command", "maintain")
+        command_receipt = meta.get("current_command_receipt")
+        locked = bool(meta.get("locked", False) or (meta.get("desired_stopped") and cmd != "doctor"))
+        name = meta.get("name", "unnamed")
+        payload_hash = meta.get("payload_hash")
+        has_payload = meta.get("has_payload", False)
+        runtime = _runtime_meta(agent_id)
+        candidate_version = str(runtime.get("candidate_version") or "")
+        reported_runtime_version = str(meta.get("runtime_agent_version") or "")
+        proc = agents.get(agent_id)
+        runtime["command_runtime_ready"] = (
+            meta.get("runtime_payload_promoted") is True
+            and meta.get("runtime_healthy") is True
+            and str(meta.get("runtime_payload_hash") or "") == str(runtime.get("last_payload_hash") or runtime.get("candidate_contract_hash") or "")
+            and reported_runtime_version == str(runtime.get("active_runtime_version") or candidate_version)
+            and proc is not None
+            and int(meta.get("runtime_agent_pid", 0) or 0) == int(getattr(proc, "pid", -1))
+        )
+        if candidate_version:
+            runtime["candidate_health_ok"] = (
+                reported_runtime_version == candidate_version
+                and meta.get("runtime_healthy") is True
+                and str(meta.get("runtime_payload_hash") or "") == str(runtime.get("candidate_contract_hash") or "")
+                and proc is not None
+                and int(meta.get("runtime_agent_pid", 0) or 0) == int(getattr(proc, "pid", -1))
+                and float(meta.get("runtime_heartbeat_at", 0) or 0) > 0
+            )
+            runtime["candidate_health_observed_at"] = time.time()
+
+        if meta.get("cache_purge_requested"):
+            purge_request_id = meta.get("cache_purge_request_id")
+            if not isinstance(purge_request_id, str) or not purge_request_id.strip():
+                log_agent("CACHE PURGE REJECTED", agent_id, name, "missing cache purge request id", level="ERR")
+                _append_local_audit("agent_runtime_cache_purge_rejected", agent_id=agent_id, reason="missing-request-id")
+                continue
+            purge_request_id = purge_request_id.strip()
+            if _completed_agent_cache_purge_request_ids.get(agent_id) == purge_request_id:
+                _append_local_audit("agent_runtime_cache_purge_stale", agent_id=agent_id, request_id=purge_request_id)
+                continue
+            was_running = agent_id in agents
+            if _purge_agent_runtime_cache(agent_id, name=name):
+                _pending_agent_cache_purge_acks[agent_id] = {
+                    "request_id": purge_request_id,
+                    "success": True,
+                }
+                _completed_agent_cache_purge_request_ids[agent_id] = purge_request_id
+                _persist_runtime_state()
+                changed = changed or was_running
+                log_agent("CACHE PURGED", agent_id, name, "runtime cache cleared; acknowledgement queued", level="WARN")
+            else:
+                log_agent("CACHE PURGE FAILED", agent_id, name, "runtime cache was not fully cleared; no acknowledgement queued", level="ERR")
+            continue
+
+        if cmd == "maintain" and _command_receipt_id(command_receipt):
+            if _begin_command_result(command_receipt, "agent", agent_id, cmd):
+                _queue_command_result(command_receipt, "agent", agent_id, cmd, "succeeded")
+            continue
+
+        if locked or cmd == "stop":
+            should_execute_command = _begin_command_result(command_receipt, "agent", agent_id, cmd) if cmd == "stop" else True
+            if cmd == "stop" and not should_execute_command:
+                continue
+            if agent_id in agents:
+                reason = "locked" if locked else "stop-cmd"
+                if kill_agent(agent_id, name=name, reason=reason):
+                    changed = True
+                else:
+                    if cmd == "stop":
+                        _queue_command_result(command_receipt, "agent", agent_id, cmd, "failed", "Agent process containment could not be verified")
+                    continue
+            _clear_runtime_meta(agent_id)
+            if cmd == "stop":
+                _queue_command_result(command_receipt, "agent", agent_id, cmd, "succeeded")
+            continue
+
+        if cmd == "doctor":
+            if not _begin_command_result(command_receipt, "agent", agent_id, cmd):
+                continue
+            proc = agents.get(agent_id)
+            audit = {
+                "agent_id": agent_id,
+                "name": name,
+                "running": bool(proc is not None and proc.poll() is None),
+                "payload_hash": payload_hash or runtime.get("last_payload_hash", ""),
+                "has_cached_payload": bool(runtime.get("last_payload_encrypted") or runtime.get("last_payload")),
+                "suspended_until": runtime.get("suspended_until", 0.0),
+                "crash_count": len(runtime.get("crash_times", [])),
+            }
+            _append_local_audit("agent_doctor", **audit)
+            log_agent("DOCTOR", agent_id, name, json.dumps(audit, separators=(",", ":"), sort_keys=True), level="OK")
+            changed = True
+            _queue_command_result(command_receipt, "agent", agent_id, cmd, "succeeded")
+            continue
+
+        proc = agents.get(agent_id)
+        if proc is not None and proc.poll() is None:
+            _surface_node_skips(agent_id, name)
+            meta_now = _runtime_meta(agent_id)
+            started_at = float(meta_now.get("last_start_at", 0) or 0)
+            if started_at and (time.time() - started_at) >= 60 and meta_now.get("crash_times"):
+                meta_now["crash_times"] = []
+
+        if not has_payload:
+            if proc is not None:
+                changed = bool(kill_agent(agent_id, name=name, reason="no-payload")) or changed
+            continue
+
+        allowed, wait_seconds, suspend_reason = _can_attempt_start(agent_id)
+        if not allowed and (proc is None or proc.poll() is not None):
+            log_agent("SUSPENDED", agent_id, name, f"{suspend_reason}  retry_in:{wait_seconds}s", level="WARN")
+            continue
+
+        if cmd in ("restart", "update"):
+            if not _begin_command_result(command_receipt, "agent", agent_id, cmd):
+                continue
+            _apply_rollout_delay(meta, agent_id, name)
+            payload = _agent_payload_for_start(agent_id, name)
+            if payload:
+                if not kill_agent(agent_id, name=name, reason="restart-cmd", wait_for_ports=True):
+                    _queue_command_result(command_receipt, "agent", agent_id, cmd, "failed", "Existing agent process could not be stopped")
+                    continue
+                previous_receipt = runtime.get("candidate_command_receipt")
+                if _command_receipt_id(previous_receipt) and _command_receipt_id(previous_receipt) != _command_receipt_id(command_receipt):
+                    _queue_command_result(previous_receipt, "agent", agent_id, str(previous_receipt.get("command") or "restart"), "failed", "Candidate was superseded by a newer exact command receipt")
+                    runtime.pop("candidate_command_receipt", None)
+                    runtime.pop("candidate_command_outcome", None)
+                try:
+                    spawn_agent(agent_id, payload, name=name, payload_hash=payload_hash, candidate_version=meta.get("desired_runtime_version", ""), persist_state=not _progress.active, runtime_retry_id=_command_receipt_id(command_receipt))
+                    changed = True
+                    if _command_receipt_id(command_receipt):
+                        runtime["candidate_command_receipt"] = dict(command_receipt)
+                        _persist_runtime_state()
+                except Exception as exc:
+                    _record_crash(agent_id)
+                    _queue_command_result(command_receipt, "agent", agent_id, cmd, "failed", str(exc))
+            elif proc is not None and proc.poll() is None:
+                _queue_command_result(command_receipt, "agent", agent_id, cmd, "failed", "Requested runtime was unavailable; existing runtime kept running")
+            elif _spawn_from_cached_payload(agent_id, name):
+                changed = True
+                _queue_command_result(command_receipt, "agent", agent_id, cmd, "failed", "Requested runtime was unavailable; previous verified cache restored for continuity")
+            else:
+                _queue_command_result(command_receipt, "agent", agent_id, cmd, "failed", "No verified agent payload was available")
+
+        elif proc is None or proc.poll() is not None:
+            if proc is not None:
+                _tail = _agent_log_tail(agent_id)
+                _last = _tail[-1] if _tail else ""
+                _why = f"exited - last log: {_last[:140]}" if _last else "exited (no log output captured)"
+                log_agent("CRASHED", agent_id, name, _why + "  - respawning", level="WARN")
+                if not _record_crash(agent_id):
+                    log_agent("SUSPENDED", agent_id, name, f"crash loop detected  retry_in:{AGENT_RESPAWN_WINDOW_SECONDS}s", level="ERR")
+                    continue
+            if not kill_agent(agent_id, name=name, reason="crash", wait_for_ports=True):
+                continue
+            if runtime.get("candidate_version"):
+                if _rollback_candidate(agent_id, name):
+                    changed = True
+                continue
+            _apply_rollout_delay(meta, agent_id, name)
+            payload = _agent_payload_for_start(agent_id, name)
+            if payload:
+                try:
+                    spawn_agent(agent_id, payload, name=name, payload_hash=payload_hash, candidate_version=meta.get("desired_runtime_version", ""), persist_state=not _progress.active)
+                    changed = True
+                except Exception as exc:
+                    _record_crash(agent_id)
+                    log_agent("SPAWN ERROR", agent_id, name, str(exc)[:100], level="ERR")
+            elif _spawn_from_cached_payload(agent_id, name):
+                changed = True
+            elif runtime.get("last_fetch_failure_at") and (time.time() - float(runtime.get("last_fetch_failure_at") or 0)) < AGENT_FETCH_RETRY_DELAY_SECONDS:
+                log_agent("BACKOFF", agent_id, name, f"fetch failed  retry_in:{AGENT_FETCH_RETRY_DELAY_SECONDS}s", level="WARN")
+
+    for agent_id in list(agents.keys()):
+        if agent_id not in server_agents:
+            if kill_agent(agent_id, name="unknown", reason="removed-from-server"):
+                agent_runtime_meta.pop(agent_id, None)
+                changed = True
+
+    if _progress.active:
+        _persist_runtime_state()
+    _progress.end()
+    _emit_node_skip_summary()
+    return changed
+
+def shutdown_all_agents(reason="launcher-shutdown"):
+    log(f"Shutting down {len(agents)} agent(s)...", level="WARN")
+    targets = [(aid, agent_names.get(aid, "unnamed"), reason) for aid in list(agents.keys())]
+    stopped = kill_agents_concurrently(targets)
+
+    time.sleep(0.3)
+    if agents:
+        log(f"Failed to stop {len(agents)} agent(s); launcher will remain active and retry.", level="ERR")
+        return False
+    log(f"All agents stopped ({stopped}).", level="OK")
+    return True
+
+def perform_launcher_shutdown(reason="signal-shutdown", message=None, command_receipt=None, command=""):
+    global shutdown_flag, shutdown_in_progress
+    if shutdown_in_progress:
+        return
+    shutdown_in_progress = True
+    shutdown_flag = True
+    if message:
+        log(message, level="WARN")
+    if not shutdown_all_agents(reason=reason):
+        if command_receipt:
+            _queue_command_result(command_receipt, "launcher", LAUNCHER_HOST_ID, command, "failed", "One or more agents could not be stopped")
+        shutdown_flag = False
+        shutdown_in_progress = False
+        return False
+    if not cleanup_orphaned_runtime_processes():
+        if command_receipt:
+            _queue_command_result(command_receipt, "launcher", LAUNCHER_HOST_ID, command, "failed", "Runtime process containment could not be verified")
+        shutdown_flag = False
+        shutdown_in_progress = False
+        return False
+    cleanup_agent_artifacts()
+    if command_receipt:
+        _queue_command_result(command_receipt, "launcher", LAUNCHER_HOST_ID, command, "succeeded")
+    offline_payload = {
+        "client_id": CLIENT_ID,
+        "launcher_host_id": LAUNCHER_HOST_ID,
+        "reason": reason,
+        "command_protocol_version": 2,
+        "command_results": [dict(result) for result in _pending_command_results.values()],
+    }
+    try:
+        _request_with_retries("/launcher/offline", offline_payload, timeout=4, attempts=2)
+    except Exception as exc:
+        if command_receipt:
+            log(f"Could not confirm shutdown acknowledgement: {exc}; it will remain pending for timeout review.", level="WARN")
+    release_singleton_lock()
+    os._exit(0)
+
+def signal_handler(sig, frame):
+    sig_name = "Interrupt" if sig == signal.SIGINT else f"Signal {sig}"
+    perform_launcher_shutdown(reason="signal-shutdown", message=f"{sig_name} received - stopping all nodes...")
+
+def write_trust_console():
+    if not TRUST_CONSOLE_B64:
+        return
+    try:
+        data = base64.b64decode(TRUST_CONSOLE_B64.encode("ascii"))
+        dest = os.path.join(os.path.dirname(os.path.realpath(__file__)), "infraveil.py")
+        expected_sha = hashlib.sha256(data).hexdigest()
+        actual_sha = ""
+        if os.path.isfile(dest):
+            with open(dest, "rb") as f:
+                actual_sha = hashlib.sha256(f.read()).hexdigest()
+        if actual_sha != expected_sha:
+            _atomic_write_text(dest, data.decode("utf-8"))
+        try:
+            os.chmod(dest, 0o700)
+        except Exception:
+            pass
+        with open(dest, "rb") as f:
+            installed_sha = hashlib.sha256(f.read()).hexdigest()
+        if installed_sha != expected_sha:
+            raise RuntimeError("Trust Console file did not match its embedded hash after installation")
+        log("Infraveil Trust Console available: " + dest, level="OK")
+        log("Verified Trust Console sha256 " + installed_sha[:16] + "...", level="INFO")
+    except Exception as exc:
+        log("Could not install the verified Trust Console: " + str(exc)[:120], level="ERR")
+
+if __name__ == "__main__":
+    init_console()
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    NONINTERACTIVE = ("--yes" in sys.argv) or ("-y" in sys.argv) or ("--noninteractive" in sys.argv)
+    _migrate_legacy_layout()
+    acquire_singleton_lock()
+    _load_runtime_state()
+
+    ONBOARDING = _load_onboarding()
+    if ONBOARDING is None:
+        if _interactive():
+            ONBOARDING = run_onboarding()
+        else:
+            ONBOARDING = {"venv": True, "install_deps": True, "service": False, "service_registered": False, "auto_defaults": True}
+        _save_onboarding(ONBOARDING)
+
+    PYTHON_CMD = ensure_venv()
+    if not cleanup_orphaned_runtime_processes():
+        log("Could not verify cleanup of an older Infraveil runtime; refusing to start new agents.", level="ERR")
+        release_singleton_lock()
+        sys.exit(1)
+    cleanup_agent_artifacts()
+    write_trust_console()
+
+    if ONBOARDING.get("service") and not ONBOARDING.get("service_registered"):
+        _svc_ok, _svc_msg, _svc_handoff = _register_boot_service(PYTHON_CMD, os.path.realpath(__file__))
+        log(_svc_msg, level="OK" if _svc_ok else "WARN")
+        if _svc_ok:
+            ONBOARDING["service_registered"] = True
+            _save_onboarding(ONBOARDING)
+            if _svc_handoff:
+                log("Handing the launcher to macOS launchd; it will continue in the background.", level="OK")
+                release_singleton_lock()
+                raise SystemExit(0)
+
+    print("", flush=True)
+    print(f"  \033[94m{'─' * 52}\033[0m", flush=True)
+    print(f"  {c(ANSI_WHITE)}INFRAVEIL{c(ANSI_RESET)}  {c(ANSI_GREY)}Secure Agent Daemon{c(ANSI_RESET)}", flush=True)
+    print(f"  {c(ANSI_GREY)}Client : {CLIENT_ID[:24]}...{c(ANSI_RESET)}", flush=True)
+    print(f"  {c(ANSI_GREY)}Endpoint: {BASE_URL}{c(ANSI_RESET)}", flush=True)
+    print(f"  \033[94m{'─' * 52}\033[0m", flush=True)
+    print("", flush=True)
+    log("Infraveil connection established.", level="OK")
+    log(f"Python {platform.python_version()} detected.", level="OK")
+    if shutil.which("node"):
+        log("Node.js detected — Node-based services can run.", level="OK")
+    else:
+        log("Node.js not found — services that need Node will be skipped until it is installed.", level="WARN")
+        log("Install it with:  " + _node_install_hint(), level="WARN")
+    _append_local_audit("launcher_started", version=LAUNCHER_VERSION, source_hash=_launcher_source_hash(), host_fingerprint=_host_fingerprint())
+    log(f"Control check: {CONTROL_POLL_INTERVAL:.1f}s; full reconciliation: {CHECK_INTERVAL}s.", level="INFO")
+    print("", flush=True)
+
+    next_full_sync = 0.0
+    next_control_poll = time.monotonic() + random.uniform(0.0, control_poll_interval)
+    while not shutdown_flag:
+        try:
+            now = time.monotonic()
+            should_sync = now >= next_full_sync
+            if not should_sync and control_plane_online and now >= next_control_poll:
+                should_sync = poll_control_revision()
+                next_control_poll = time.monotonic() + control_poll_interval
+            if should_sync:
+                changed = sync()
+                now = time.monotonic()
+                if control_plane_online:
+                    next_full_sync = now + (FAST_RETRY_INTERVAL if changed else CHECK_INTERVAL)
+                    next_control_poll = now + control_poll_interval
+                else:
+                    next_full_sync = now + min(30, max(CHECK_INTERVAL, 3 * sync_failure_count))
+                    next_control_poll = next_full_sync
+            wake_at = min(next_full_sync, next_control_poll) if control_plane_online else next_full_sync
+            time.sleep(max(0.05, min(control_poll_interval, wake_at - time.monotonic())))
+        except KeyboardInterrupt:
+            signal_handler(signal.SIGINT, None)
+        except Exception:
+            time.sleep(FAST_RETRY_INTERVAL)
